@@ -20,6 +20,8 @@ pub(crate) mod sealed {
 pub(crate) trait SealedInstance: Gate<MrccPeriphConfig = I3cConfig> {
     fn info() -> &'static Info;
 
+    /// Clock instance
+    const CLOCK_INSTANCE: crate::clocks::periph_helpers::I3cInstance;
     const PERF_INT_INCR: fn();
     const PERF_INT_WAKE_INCR: fn();
     const TX_DMA_REQUEST: DmaRequest;
@@ -72,6 +74,8 @@ macro_rules! impl_i3c_instance {
                     &INFO
                 }
 
+                const CLOCK_INSTANCE: crate::clocks::periph_helpers::I3cInstance
+                    = crate::clocks::periph_helpers::I3cInstance::[<I3c $n>];
                 const TX_DMA_REQUEST: DmaRequest = DmaRequest::[<I3C $n Tx>];
                 const RX_DMA_REQUEST: DmaRequest = DmaRequest::[<I3C $n Rx>];
                 const PERF_INT_INCR: fn() = crate::perf_counters::[<incr_interrupt_i3c $n>];

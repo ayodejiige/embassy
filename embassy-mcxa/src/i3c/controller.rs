@@ -18,7 +18,19 @@ use crate::pac::i3c::{
     Disto, Hkeep, Ibiresp, Ibitype, MctrlDir as I3cDir, MdatactrlRxtrig, MdatactrlTxtrig, Mstena, Request, State, Type,
 };
 
-const MAX_CHUNK_SIZE: usize = 256;
+// Max bytes read per `MCTRL.RDTERM`-terminated segment.
+//
+// `RDTERM` is an 8-bit "read terminate counter": the controller auto-terminates
+// the SDR read (driving the abort T-bit) after this many bytes. `RDTERM=0`
+// means "do not auto-terminate" (the target ends the read via its own T-bit),
+// NOT 256.** Reads longer than this are split into multiple ≤255-byte segments,
+// each issued with its own repeated-START and `RDTERM = segment_len` so the
+// controller cleanly terminates each segment before continuing. The cap must
+// stay at 255 so `segment_len as u8` is always in `1..=255` and never wraps to
+// the "no termination" encoding mid-stream — a 256 cap silently produced
+// `RDTERM=0` on the first full segment, leaving the controller reading while the
+// next segment's START was issued, which wedged the bus (SCL high, SDA low).
+const MAX_CHUNK_SIZE: usize = 255;
 
 /// Setup Errors
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -310,7 +322,12 @@ impl<'d, M: Mode> I3c<'d, M> {
         let ClockConfig { power, source, div } = config.clock_config;
 
         // Enable clocks
-        let conf = I3cConfig { power, source, div };
+        let conf = I3cConfig {
+            power,
+            source,
+            div,
+            instance: T::CLOCK_INSTANCE,
+        };
 
         let parts = unsafe { enable_and_reset::<T>(&conf).map_err(SetupError::ClockSetup)? };
 
@@ -1087,121 +1104,176 @@ impl<'d> AsyncEngine for I3c<'d, Dma<'d>> {
         // path at the bottom can run regardless of error.
         let mut result: Result<usize, IOError> = Ok(0);
 
-        'outer: for chunk in read.chunks_mut(MAX_CHUNK_SIZE) {
-            // `chunk.len() as u8` gives RDTERM=N for 1..=255 and RDTERM=0
-            // for exactly 256 (matches SDK: "no controller-side termination;
-            // slave drives end via T-bit").
-            if let Err(e) = self.async_start(address, bus_type, Dir::Read, chunk.len() as u8).await {
-                result = Err(e);
-                break 'outer;
+        // Single continuous read. Issue ONE Start and stay in the read until
+        // either the target ends it (T-bit / COMPLETE) or, for bounded reads
+        // <= 255 bytes, RDTERM auto-terminates at the requested length.
+        //
+        // We deliberately do NOT split the read into 255-byte repeated-START
+        // segments. `RDTERM` (8-bit) caps controller-side termination at 255,
+        // but that is a *termination* limit, not a transfer-size limit: many
+        // targets pre-arm a single end-marked DMA payload and stream the whole
+        // response as one read, refusing to re-arm across a repeated-START
+        // (observed: target goes silent after the controller's Sr). So:
+        //   - len <= 255 : RDTERM = len  (clean byte-exact HW cutoff)
+        //   - len  > 255 : RDTERM = 0    (no auto-termination; the target ends
+        //                  the read via its T-bit, or we stop once the buffer
+        //                  is full).
+        let rdterm: u8 = if read.len() <= 255 { read.len() as u8 } else { 0 };
+
+        if let Err(e) = self.async_start(address, bus_type, Dir::Read, rdterm).await {
+            #[cfg(feature = "defmt")]
+            defmt::trace!("[rd] exit: async_start err {:?}", e);
+            result = Err(e);
+        } else {
+            #[cfg(feature = "defmt")]
+            {
+                let st = self.info.regs().mstatus().read();
+                defmt::trace!(
+                    "[rd] after async_start: rdterm={=u8} state={:?} complete={=bool} errwarn={=bool} mctrldone={=bool}",
+                    rdterm,
+                    st.state(),
+                    st.complete(),
+                    st.errwarn(),
+                    st.mctrldone()
+                );
             }
 
-            let peri_addr = self.info.regs().mrdatab().as_ptr() as *const u8;
+            // Drain the single read into the buffer. The 255 cap is RDTERM's,
+            // not the DMA's, so one read may span many DMA major loops: re-arm
+            // the DMA (WITHOUT a new Start) every DMA_MAX_TRANSFER_SIZE bytes
+            // until the target ends the read or the buffer is full.
+            'outer: for chunk in read.chunks_mut(DMA_MAX_TRANSFER_SIZE) {
+                let peri_addr = self.info.regs().mrdatab().as_ptr() as *const u8;
 
-            unsafe {
-                // Clean up channel state
-                self.mode.rx_dma.disable_request();
-                self.mode.rx_dma.clear_done();
-                self.mode.rx_dma.clear_interrupt();
+                unsafe {
+                    // Clean up channel state
+                    self.mode.rx_dma.disable_request();
+                    self.mode.rx_dma.clear_done();
+                    self.mode.rx_dma.clear_interrupt();
 
-                // Set DMA request source from instance type (type-safe)
-                self.mode.rx_dma.set_request_source(self.mode.rx_request);
+                    // Set DMA request source from instance type (type-safe)
+                    self.mode.rx_dma.set_request_source(self.mode.rx_request);
 
-                // Configure TCD for peripheral-to-memory transfer
-                if let Err(e) = self.mode.rx_dma.setup_read_from_peripheral(
-                    peri_addr,
-                    chunk,
-                    false,
-                    TransferOptions::COMPLETE_INTERRUPT,
-                ) {
-                    result = Err(e.into());
-                    break 'outer;
+                    // Configure TCD for peripheral-to-memory transfer
+                    if let Err(e) = self.mode.rx_dma.setup_read_from_peripheral(
+                        peri_addr,
+                        chunk,
+                        false,
+                        TransferOptions::COMPLETE_INTERRUPT,
+                    ) {
+                        #[cfg(feature = "defmt")]
+                        defmt::trace!("[rd] exit: setup_read_from_peripheral err");
+                        result = Err(e.into());
+                        break 'outer;
+                    }
+
+                    // Enable I3C RX DMA request
+                    self.info
+                        .regs()
+                        .mdmactrl()
+                        .modify(|w| w.set_dmafb(MdmactrlDmafb::Enable));
+
+                    // Enable DMA channel request
+                    self.mode.rx_dma.enable_request();
                 }
 
-                // Enable I3C RX DMA request
+                // Race DMA-done (this buffer chunk filled) vs I3C
+                // COMPLETE/errwarn (target ended the read, possibly mid-chunk).
+                core::future::poll_fn(|cx| {
+                    let _ = self.mode.rx_dma.wait_cell().poll_wait(cx);
+                    let _ = self.info.wait_cell().poll_wait(cx);
+
+                    // Enable I3C complete + errwarn interrupts so the I3C IRQ
+                    // can wake us if DMA never finishes.
+                    self.info.regs().mintset().write(|w| {
+                        w.set_complete(true);
+                        w.set_errwarn(true);
+                    });
+
+                    let st = self.info.regs().mstatus().read();
+                    if self.mode.rx_dma.is_done() || st.complete() || st.errwarn() {
+                        core::task::Poll::Ready(())
+                    } else {
+                        core::task::Poll::Pending
+                    }
+                })
+                .await;
+
+                // Ensure DMA writes are visible to CPU
+                cortex_m::asm::dsb();
+
+                // `transferred_bytes()` is derived from `(BITER - CITER)` and is
+                // only valid *mid-transfer*: on major-loop completion the eDMA
+                // reloads `CITER` back to `BITER`, collapsing the count to 0. So
+                // a fully-drained chunk moved `chunk.len()`; only the
+                // early-terminated case (target drove its T-bit before the chunk
+                // filled) uses the partial `transferred_bytes()` count.
+                let dma_done = self.mode.rx_dma.is_done();
+                let chunk_done = if dma_done {
+                    chunk.len()
+                } else {
+                    self.mode.rx_dma.transferred_bytes().min(chunk.len())
+                };
+
+                // Cleanup
                 self.info
                     .regs()
                     .mdmactrl()
-                    .modify(|w| w.set_dmafb(MdmactrlDmafb::Enable));
-
-                // Enable DMA channel request
-                self.mode.rx_dma.enable_request();
-            }
-
-            // Race DMA-done vs I3C COMPLETE/errwarn. The target may end
-            // the read early via T-bit; in that case the IP fires COMPLETE
-            // but DMA stalls. Without this race we'd hang until something
-            // else nudges us, then misreport the latched MERRWARN.
-            core::future::poll_fn(|cx| {
-                let _ = self.mode.rx_dma.wait_cell().poll_wait(cx);
-                let _ = self.info.wait_cell().poll_wait(cx);
-
-                // Enable I3C complete + errwarn interrupts so the I3C IRQ
-                // can wake us if DMA never finishes.
-                self.info.regs().mintset().write(|w| {
-                    w.set_complete(true);
-                    w.set_errwarn(true);
-                });
-
-                let st = self.info.regs().mstatus().read();
-                if self.mode.rx_dma.is_done() || st.complete() || st.errwarn() {
-                    core::task::Poll::Ready(())
-                } else {
-                    core::task::Poll::Pending
+                    .modify(|w| w.set_dmafb(MdmactrlDmafb::NotUsed));
+                unsafe {
+                    self.mode.rx_dma.disable_request();
+                    self.mode.rx_dma.clear_done();
                 }
-            })
-            .await;
 
-            // Ensure DMA writes are visible to CPU
-            cortex_m::asm::dsb();
+                let st_after = self.info.regs().mstatus().read();
+                bytes_received += chunk_done;
 
-            // How many bytes did DMA actually move into this chunk?
-            let chunk_done = self.mode.rx_dma.transferred_bytes().min(chunk.len());
+                #[cfg(feature = "defmt")]
+                defmt::trace!(
+                    "[rd] chunk woke: dma_done={=bool} complete={=bool} errwarn={=bool} chunk_done={=usize}/{=usize} total={=usize}",
+                    dma_done,
+                    st_after.complete(),
+                    st_after.errwarn(),
+                    chunk_done,
+                    chunk.len(),
+                    bytes_received
+                );
 
-            // Cleanup
-            self.info
-                .regs()
-                .mdmactrl()
-                .modify(|w| w.set_dmafb(MdmactrlDmafb::NotUsed));
-            unsafe {
-                self.mode.rx_dma.disable_request();
-                self.mode.rx_dma.clear_done();
-            }
+                // This buffer chunk filled completely and the read is still
+                // live (target hasn't ended, no error). Continue into the next
+                // buffer chunk WITHOUT issuing a new Start.
+                if dma_done && !st_after.complete() && !st_after.errwarn() {
+                    result = Ok(bytes_received);
+                    continue 'outer;
+                }
 
-            let st_after = self.info.regs().mstatus().read();
-            bytes_received += chunk_done;
-
-            // Classify the outcome. Per spec, target-terminated SDR reads
-            // can end before RDTERM with no error — and that's what SDK
-            // sees (status=0). The MCXA IP may still latch MERRWARN bits
-            // (nack/term/etc.) on certain RDTERM mismatch patterns.
-            //
-            // Rule (mirrors SDK behavior):
-            //   - bytes_received > 0 with any errwarn → spec-compliant
-            //     short read; suppress, return Ok(bytes_received).
-            //   - bytes_received == 0 with errwarn → real bus error
-            //     (true address NACK, parity, etc.); propagate.
-            //   - errwarn at chunk boundary with full chunk: same rule
-            //     (we got the bytes we asked for, suppress).
-            if chunk_done < chunk.len() {
+                // Otherwise the read is over: the target ended it (COMPLETE),
+                // the buffer is full, or an error/warning latched.
+                //
+                // Per spec a target-terminated SDR read can end before the
+                // requested length with no error. The MCXA IP may still latch
+                // a benign MERRWARN on certain RDTERM mismatch patterns:
+                //   - bytes_received > 0 with errwarn → spec-compliant short
+                //     read; suppress and return Ok(bytes_received).
+                //   - bytes_received == 0 with errwarn → real bus error
+                //     (address NACK, parity, etc.); propagate.
                 if st_after.errwarn() {
                     if bytes_received > 0 {
+                        #[cfg(feature = "defmt")]
+                        defmt::trace!("[rd] exit: errwarn + data, suppressed -> Ok({=usize})", bytes_received);
                         self.clear_errors();
                         result = Ok(bytes_received);
                     } else {
+                        #[cfg(feature = "defmt")]
+                        defmt::trace!("[rd] exit: 0 bytes + errwarn -> Err (status={:?})", self.status().err());
                         result = Err(self.status().err().unwrap_or(IOError::Other));
                     }
                 } else {
+                    #[cfg(feature = "defmt")]
+                    defmt::trace!("[rd] exit: read complete -> Ok({=usize})", bytes_received);
                     result = Ok(bytes_received);
                 }
                 break 'outer;
-            } else {
-                if st_after.errwarn() {
-                    // Full chunk delivered + errwarn. Suppress as long as
-                    // we did get data.
-                    self.clear_errors();
-                }
-                result = Ok(bytes_received);
             }
         }
 
@@ -1213,11 +1285,16 @@ impl<'d> AsyncEngine for I3c<'d, Dma<'d>> {
         // Without this, the target sees a dirty bus on its next listen and
         // raises SdrParity.
         if send_stop == SendStop::Yes {
+            #[cfg(feature = "defmt")]
+            defmt::trace!("[rd] emitting Stop");
             let _ = self.async_stop(bus_type).await;
         }
 
         // defuse it if the future is not dropped
         on_drop.defuse();
+
+        #[cfg(feature = "defmt")]
+        defmt::trace!("[rd] return {:?}", result);
 
         result
     }

@@ -16,8 +16,9 @@ use embassy_hal_internal::drop::OnDrop;
 use grounded::uninit::GroundedCell;
 
 use super::{Info, Instance, SclPin, SdaPin};
+use crate::clocks::periph_helpers::PreEnableParts;
 pub use crate::clocks::periph_helpers::{Div4, I3cClockSel, I3cConfig};
-use crate::clocks::{ClockError, PoweredClock, WakeGuard, enable_and_reset};
+use crate::clocks::{ClockError, PoweredClock, WakeGuard, assert_reset, disable, enable_and_reset, release_reset};
 use crate::dma::{Channel, DmaChannel, DmaRequest, TransferOptions};
 use crate::gpio::{AnyPin, SealedPin};
 use crate::interrupt::typelevel;
@@ -125,6 +126,7 @@ impl From<BusType> for Type {
 
 /// I3C target configuration
 #[non_exhaustive]
+#[derive(Clone)]
 pub struct Config {
     /// 7-bit target address.
     pub address: Option<u8>,
@@ -162,6 +164,12 @@ pub struct Config {
 
     /// Clock configuration
     pub clock_config: ClockConfig,
+
+    /// Device characteristics (DCR)
+    ///
+    /// This field represents the device characteristics register value, which
+    /// determines the type of the I3C target device.
+    pub device_characteristics: u8,
 }
 
 impl Default for Config {
@@ -175,6 +183,7 @@ impl Default for Config {
             ibi_capable: false,
             ibi_has_payload: false,
             clock_config: ClockConfig::default(),
+            device_characteristics: 0,
         }
     }
 }
@@ -235,7 +244,10 @@ pub enum Event {
     Matched,
     /// Our address was matched while in HDR-DDR mode.
     HdrMatched,
-    /// A Common Command Code (CCC) was received from the controller.
+    /// An unhandled (vendor/broadcast) Common Command Code (CCC) transaction is
+    /// ready to read. Drain it with [`Self::dma_respond_to_write`]
+    ///
+    /// The CCC command code is the first byte, followed by any CCC payload.
     Ccc,
     /// A previously dispatched CCC has been handled by the hardware.
     CccHandled,
@@ -244,7 +256,7 @@ pub enum Event {
     DynamicAddressChanged,
     /// IBI / mastership / hot-join event status changed; inspect
     /// `SSTATUS.EVDET` for the precise outcome.
-    EventStatusChanged,
+    EventStatusChanged(Evdet),
     /// The RX FIFO contains data ready to be read.
     RxPending,
     /// The controller has addressed us for a read (SSTATUS.STREQRD == Busy)
@@ -268,11 +280,119 @@ pub struct I3c<'d> {
     _sda: Peri<'d, AnyPin>,
     tx_dma: DmaChannel<'d>,
     tx_request: DmaRequest,
+    clock_cfg: I3cConfig,
+    active_config: Config,
+    reinit_fn: unsafe fn(&I3cConfig) -> Result<PreEnableParts, ClockError>,
     freq: u32,
+    ccc_pending: bool,
     _wg: Option<WakeGuard>,
 }
 
 impl<'d> I3c<'d> {
+    /// Returns the configured static target address, if present.
+    pub fn static_address(&self) -> Option<u8> {
+        let addr = self.info.regs().sconfig().read().saddr();
+        if addr == 0 { None } else { Some(addr) }
+    }
+
+    /// Returns the currently mapped dynamic address, if one is active.
+    ///
+    /// This uses `SMAPCTRL0` (`ena` + `da`) as the hardware-visible dynamic
+    /// address view for target mode.
+    pub fn dynamic_address(&self) -> Option<u8> {
+        let map = self.info.regs().smapctrl0().read();
+        if map.ena() {
+            let addr = map.da();
+            if addr == 0 { None } else { Some(addr) }
+        } else {
+            None
+        }
+    }
+
+    /// Update Device Characteristics Register (DCR) at runtime.
+    ///
+    /// Callers should ensure the bus is quiescent (no active transaction)
+    /// before changing identity fields that the controller may query.
+    pub fn set_device_characteristics(&mut self, dcr: u8) {
+        self.active_config.device_characteristics = dcr;
+        self.info.regs().sidext().modify(|w| w.set_dcr(dcr));
+    }
+
+    /// Restart the target-side state machine without reconstructing the driver.
+    ///
+    /// This is useful after runtime identity/config updates (for example DCR).
+    /// Must be called only while no transfer is in flight.
+    pub fn restart_target(&mut self) {
+        // Disable target while we clear state.
+        self.info.regs().sconfig().modify(|w| w.set_slvena(false));
+
+        // Clear pending interrupt/error state and FIFO contents.
+        self.info.regs().sintclr().write(|w| w.0 = u32::MAX);
+        self.info.regs().serrwarn().write(|w| w.0 = u32::MAX);
+        self.clear_status();
+        self.flush_fifos();
+
+        // Re-enable target with existing addressing/config.
+        self.info.regs().sconfig().modify(|w| w.set_slvena(true));
+    }
+
+    /// Restart the target state machine and immediately request Hot-Join.
+    ///
+    /// Ordering requirement: `SCTRL.EVENT=HotJoinRequest` must be programmed
+    /// before `SCONFIG.SLVENA` is enabled.
+    pub async fn restart_target_with_hot_join(&mut self) -> Result<(), IOError> {
+        #[cfg(feature = "defmt")]
+        defmt::info!("HJ restart: begin");
+
+        // Reinit-style path: quiesce bus, clear peripheral state, then
+        // request hot-join and wait for completion status.
+        #[cfg(feature = "defmt")]
+        defmt::info!("HJ restart: waiting for bus idle");
+
+        self.wait_for_end_of_chain().await?;
+
+        // A hard peripheral reinit clears I3C-side DMA enable state. If an RX
+        // grant is active, finalize it before reset so we can deterministically
+        // re-arm RX DMA afterward.
+        let pre_state = self.bbq_state.state.load(Ordering::Acquire);
+        if (pre_state & STATE_RXDMA_PRESENT) != 0 && (pre_state & STATE_RXGR_ACTIVE) != 0 {
+            unsafe { self.bbq_state.finalize_read(self.info) };
+        }
+
+        #[cfg(feature = "defmt")]
+        defmt::info!("HJ restart: bus idle, full deinit+init");
+
+        let parts = unsafe { (self.reinit_fn)(&self.clock_cfg) }.map_err(|_| IOError::Other)?;
+        self.freq = parts.freq;
+        self._wg = parts.wake_guard;
+
+        self.set_configuration_internal(&self.active_config, false)
+            .map_err(|_| IOError::Other)?;
+
+        // Re-arm the always-on RX DMA path after hard reinit.
+        let post_state = self.bbq_state.state.load(Ordering::Acquire);
+        if (post_state & STATE_RXDMA_PRESENT) != 0 && (post_state & STATE_RXGR_ACTIVE) == 0 {
+            unsafe {
+                self.bbq_state.start_read_transfer(self.info);
+            }
+            self.info.regs().sintset().write(|w| w.set_stop(true));
+        }
+
+        #[cfg(feature = "defmt")]
+        defmt::info!("HJ restart: reinit done, requesting hot-join");
+
+        let result = self.dma_send_hot_join().await;
+
+        #[cfg(feature = "defmt")]
+        match &result {
+            Ok(()) => defmt::info!("HJ restart: completed (ack)"),
+            Err(IOError::IbiNacked) => defmt::info!("HJ restart: completed (nack)"),
+            Err(e) => defmt::info!("HJ restart: completed (error={:?})", e),
+        }
+
+        result
+    }
+
     fn new_inner<T: Instance>(
         _peri: Peri<'d, T>,
         scl: Peri<'d, impl SclPin<T>>,
@@ -280,10 +400,15 @@ impl<'d> I3c<'d> {
         tx_dma: DmaChannel<'d>,
         config: Config,
     ) -> Result<Self, SetupError> {
-        let ClockConfig { power, source, div } = config.clock_config;
+        let ClockConfig { power, source, div } = config.clock_config.clone();
 
         // Enable clocks
-        let conf = I3cConfig { power, source, div };
+        let conf = I3cConfig {
+            power,
+            source,
+            div,
+            instance: T::CLOCK_INSTANCE,
+        };
 
         let parts = unsafe { enable_and_reset::<T>(&conf).map_err(SetupError::ClockSetup)? };
 
@@ -300,13 +425,26 @@ impl<'d> I3c<'d> {
             _sda,
             tx_dma,
             tx_request: T::TX_DMA_REQUEST,
+            clock_cfg: conf,
+            active_config: config,
+            reinit_fn: Self::full_deinit_init_impl::<T>,
             freq: parts.freq,
+            ccc_pending: false,
             _wg: parts.wake_guard,
         };
 
-        inst.set_configuration(&config)?;
+        inst.set_configuration(&inst.active_config)?;
 
         Ok(inst)
+    }
+
+    unsafe fn full_deinit_init_impl<T: Instance>(cfg: &I3cConfig) -> Result<PreEnableParts, ClockError> {
+        unsafe {
+            disable::<T>();
+            assert_reset::<T>();
+            release_reset::<T>();
+            enable_and_reset::<T>(cfg)
+        }
     }
 
     fn check_status(&self) -> Result<(), IOError> {
@@ -371,6 +509,10 @@ impl<'d> I3c<'d> {
     }
 
     fn set_configuration(&self, config: &Config) -> Result<(), SetupError> {
+        self.set_configuration_internal(config, true)
+    }
+
+    fn set_configuration_internal(&self, config: &Config, enable_slave: bool) -> Result<(), SetupError> {
         self.info.regs().mconfig().write(|w| w.set_mstena(Mstena::MasterOff));
 
         // Defensive wipe of all interrupt enables and W1C error/status flags
@@ -411,9 +553,7 @@ impl<'d> I3c<'d> {
         // Diagnostic logging below dumps SDYNADDR via a raw pointer so
         // we can tell whether the HW absorbed SETDASA at all.
 
-        if config.partno.is_some() {
-            let partno = config.partno.unwrap();
-
+        if let Some(partno) = config.partno {
             if partno == 0 {
                 return Err(SetupError::InvalidPartNumber);
             }
@@ -421,9 +561,7 @@ impl<'d> I3c<'d> {
             self.info.regs().sidpartno().write(|w| w.set_partno(partno));
         }
 
-        if config.vendor_id.is_some() {
-            let vendor_id = config.vendor_id.unwrap();
-
+        if let Some(vendor_id) = config.vendor_id {
             if vendor_id == 0 {
                 return Err(SetupError::InvalidVendorId);
             }
@@ -435,6 +573,12 @@ impl<'d> I3c<'d> {
             w.set_maxwr(config.max_write_len.clamp(8, 4095));
             w.set_maxrd(config.max_read_len.clamp(16, 4095));
         });
+
+        // Configure DCR (Device Characteristics Register)
+        self.info
+            .regs()
+            .sidext()
+            .modify(|w| w.set_dcr(config.device_characteristics));
 
         // Configure BCR (Bus Characteristics Register) — visible to the controller via GETBCR.
         // BCR[1]: IBI Request Capable; BCR[2]: IBI Payload (mandatory data byte follows).
@@ -449,7 +593,10 @@ impl<'d> I3c<'d> {
         // TXNOTFULL as soon as the FIFO has any space, giving software the
         // earliest opportunity to refill before underrun on a target read.
         self.info.regs().sdatactrl().modify(|w| {
-            w.set_txtrig(SdatactrlTxtrig::Triggroneless);
+            w.set_unlock(true);
+            // add fence to ensure the unlock write completes before the next write
+            fence(Ordering::Release);
+            w.set_txtrig(SdatactrlTxtrig::Triggrempty);
         });
 
         // NOTE: the SDK does NOT pre-load SDYNADDR; it relies on the HW
@@ -458,8 +605,11 @@ impl<'d> I3c<'d> {
         // which causes the directed-phase `Sr 0x0a+W` (sent in I2C mode by
         // the master during SETDASA) to be ignored.
 
-        // Enable target
-        self.info.regs().sconfig().modify(|w| w.set_slvena(true));
+        // Enable target only when explicitly requested. Hot-join restart must
+        // keep SLVENA low until SCTRL.EVENT is set to HotJoinRequest.
+        if enable_slave {
+            self.info.regs().sconfig().modify(|w| w.set_slvena(true));
+        }
 
         Ok(())
     }
@@ -579,11 +729,11 @@ impl<'d> I3c<'d> {
         }
 
         let dma_done = self.dma_tx_run(buf).await?;
-        // If the controller terminated early, surface that as `EarlyStop` so
-        // callers can react.
+        // If the controller terminated early or the bus glitched (INVSTART),
+        // surface that as `EarlyStop` so callers can react.
         match self.check_status() {
             Ok(()) => {}
-            Err(IOError::Terminated) => return Ok(ReadStatus::EarlyStop(dma_done)),
+            Err(IOError::Terminated) | Err(IOError::InvalidStart) => return Ok(ReadStatus::EarlyStop(dma_done)),
             Err(e) => return Err(e),
         }
         Ok(ReadStatus::Complete(buf.len()))
@@ -609,6 +759,13 @@ impl<'d> I3c<'d> {
         if buf.is_empty() {
             return Ok(0);
         }
+
+        // This read drains the pending frame, so clear the CCC latch on entry.
+        // A CCC frame surfaced via `Event::Ccc`; the command code is `buf[0]`
+        // of this read. Clearing here means a partial read only tags its first
+        // chunk as `Event::Ccc` (the chunk carrying the code) — any
+        // continuation surfaces as a plain `RxPending`.
+        self.ccc_pending = false;
 
         // Surface any errwarn that happened since the last call.
         self.check_status()?;
@@ -661,7 +818,27 @@ impl<'d> I3c<'d> {
                     w.set_stop(true);
                 });
                 let status = self.info.regs().sstatus().read();
-                status.errwarn() || status.stnotstop() == Stnotstop::Stopped
+                if status.errwarn() {
+                    let errwarn = self.info.regs().serrwarn().read();
+                    if errwarn.invstart() {
+                        // `INVSTART` is a transient bus glitch — the hardware already
+                        // re-synchronizes on the next valid START. It does NOT indicate
+                        // bus idle. W1C-clear it so it doesn't keep re-waking this loop,
+                        // then evaluate only the remaining (non-invstart) error bits.
+                        self.info.regs().serrwarn().write(|w| w.set_invstart(true));
+                        let mut remaining = errwarn;
+                        remaining.set_invstart(false);
+                        if remaining.0 != 0 {
+                            return true; // other real errors still set — wake up
+                        }
+                        // Invstart was the only error bit; don't wake for it — fall
+                        // through to the normal bus-idle level check.
+                        return status.stnotstop() == Stnotstop::Stopped;
+                    }
+                    // Some other (non-invstart) errwarn bit is set — wake up.
+                    return true;
+                }
+                status.stnotstop() == Stnotstop::Stopped
             })
             .await
             .map_err(|_| IOError::Other)?;
@@ -745,27 +922,184 @@ impl<'d> I3c<'d> {
         Ok(())
     }
 
-    /// Combined IBI + read response: pre-load TX DMA, raise IBI, wait for
-    /// the controller to clock out the response.
+    /// Send a Hot-Join request to the controller.
     ///
-    /// At I3C-SDR speeds the post-IBI Sr→addr window is too tight (~640 ns)
-    /// for the slave software to load the TX FIFO after observing the IBI
-    /// ACK. This method arms the DMA TX channel **before** asserting the
-    /// IBI so HW already has bytes queued by the time the controller starts
-    /// clocking the directed read that follows.
+    /// This asserts `SCTRL.EVENT=HotJoinRequest` and waits for completion
+    /// in the same style as [`Self::dma_send_ibi`].
+    pub async fn dma_send_hot_join(&mut self) -> Result<(), IOError> {
+        #[cfg(feature = "defmt")]
+        defmt::info!("HJ: clear stale event latch");
+
+        // Clear any stale EVENT latch from prior traffic so we only observe
+        // completion of this HJ request.
+        self.info.regs().sstatus().write(|w| w.set_event(true));
+
+        #[cfg(feature = "defmt")]
+        defmt::info!("HJ: set SCTRL.EVENT=HotJoinRequest");
+
+        self.info.regs().sctrl().modify(|w| {
+            w.set_event(SctrlEvent::HotJoinRequest);
+        });
+
+        #[cfg(feature = "defmt")]
+        defmt::info!("HJ: set SCONFIG.SLVENA=1 after EVENT");
+
+        self.info.regs().sconfig().modify(|w| w.set_slvena(true));
+
+        #[cfg(feature = "defmt")]
+        {
+            let scap = self.info.regs().scapabilities().read().0;
+            let sstatus = self.info.regs().sstatus().read();
+            let sraw = sstatus.0;
+
+            // SCAPABILITIES[20:16] = IBI_MR_HJ. Within this field:
+            // bit4: bus-available timing, bit3: hot-join, bit2: controller request,
+            // bit1: ibi_has_data, bit0: ibi.
+            let ibi_mr_hj = ((scap >> 16) & 0x1f) as u8;
+            let hj_capable = (ibi_mr_hj & 0b01000) != 0;
+
+            // SSTATUS[27] = HJDIS (1 means hot-join disabled).
+            let hj_disabled = ((sraw >> 27) & 0x1) != 0;
+            // SSTATUS[18] = EVENT, SSTATUS[21:20] = EVDET.
+            let event = ((sraw >> 18) & 0x1) != 0;
+            let evdet = ((sraw >> 20) & 0x3) as u8;
+
+            defmt::info!(
+                "HJ pre-wait: scap=0x{:08x} ibi_mr_hj=0b{:05b} hj_capable={} sstatus=0x{:08x} hjdis={} ibidis={:?} event={} evdet={} (0:none 1:no_req 2:nack 3:ack)",
+                scap,
+                ibi_mr_hj,
+                hj_capable,
+                sraw,
+                hj_disabled,
+                sstatus.ibidis(),
+                event,
+                evdet,
+            );
+        }
+
+        let info = self.info;
+        let _on_drop = OnDrop::new(|| {
+            info.regs().sctrl().modify(|w| w.set_event(SctrlEvent::NormalMode));
+        });
+
+        #[cfg(feature = "defmt")]
+        defmt::info!("HJ: waiting for event/errwarn");
+
+        self.info
+            .wait_cell()
+            .wait_for(|| {
+                self.info.regs().sintset().write(|w| {
+                    w.set_event(true);
+                    w.set_errwarn(true);
+                });
+
+                let status = self.info.regs().sstatus().read();
+                status.errwarn() || status.event()
+            })
+            .await
+            .map_err(|_| IOError::Other)?;
+
+        let status = self.info.regs().sstatus().read();
+
+        #[cfg(feature = "defmt")]
+        defmt::info!(
+            "HJ: wait done event={} errwarn={} evdet={:?} ibidis={:?}",
+            status.event(),
+            status.errwarn(),
+            status.evdet(),
+            status.ibidis()
+        );
+
+        self.info.regs().sstatus().write(|w| {
+            if status.event() {
+                w.set_event(true);
+            }
+        });
+
+        #[cfg(feature = "defmt")]
+        defmt::info!("HJ: restore SCTRL.EVENT=NormalMode");
+
+        self.info.regs().sctrl().modify(|w| w.set_event(SctrlEvent::NormalMode));
+
+        _on_drop.defuse();
+
+        self.check_status()?;
+
+        if status.event() && status.evdet() == Evdet::Nacked {
+            #[cfg(feature = "defmt")]
+            defmt::info!("HJ: outcome=nack");
+            return Err(IOError::IbiNacked);
+        }
+
+        #[cfg(feature = "defmt")]
+        defmt::info!("HJ: outcome=ack");
+
+        Ok(())
+    }
+
+    /// Respond to a controller directed read while raising an IBI, streaming
+    /// the payload entirely by DMA (primary entry point).
     ///
-    /// Sequence:
-    /// 1. Arm `tx_dma` against `SWDATAB` for `buf.len() - 1` bytes.
-    /// 2. Set `SDMACTRL.dmatb = ENABLE_ONE_FRAME`, enable the DMA request.
-    /// 3. Raise `SCTRL.EVENT = Ibi` (with optional MDB).
-    /// 4. Wait for DMA completion.
-    /// 5. Push the final byte to `SWDATABE` so HW emits the end-of-data
-    ///    marker (T-bit) and the controller terminates the read cleanly.
-    /// 6. On any exit path, disable the DMA request, clear
-    ///    `SDMACTRL.dmatb`, and force `SCTRL.EVENT = NormalMode`.
+    /// Dispatches by payload size to dodge a scatter-gather over-write race at
+    /// the TX FIFO boundary:
+    ///
+    /// - **`len <= INBAND_END_MAX_LEN`** →
+    ///   [`Self::dma_respond_to_read_with_ibi_inband_end`]. For payloads that
+    ///   can fully prefill the 8-deep TX FIFO before the controller starts
+    ///   clocking (i.e. `len >= FIFO_DEPTH + 1 = 9`), the 2-TCD scatter-gather
+    ///   chain hands off to the final `SWDATABE` write while the FIFO is full
+    ///   and idle; the eDMA reloads and issues that write before the I3C
+    ///   peripheral (on its slower functional clock) deasserts the DMA request,
+    ///   so the byte is silently over-written and the controller underruns
+    ///   (reads `0xFF`). The single-TCD in-band-END path has no scatter-gather
+    ///   boundary — every write stays request-paced by `TXNOTFULL` — so it is
+    ///   race-free. For small payloads its 4x word-staging cost is negligible
+    ///   (kept on the stack).
+    /// - **`len > INBAND_END_MAX_LEN`** →
+    ///   [`Self::dma_respond_to_read_with_ibi_tcd`]. The scatter-gather chain
+    ///   streams the body during active drain, so the final-byte hand-off never
+    ///   coincides with a full idle FIFO, and the 4x RAM cost of the in-band
+    ///   path is avoided.
     ///
     /// `buf` must be non-empty.
-    pub async fn dma_respond_to_read_with_ibi(&mut self, buf: &[u8]) -> Result<(), IOError> {
+    pub async fn dma_respond_to_read_with_ibi(&mut self, buf: &[u8], ibi: &[u8]) -> Result<(), IOError> {
+        /// Max payload (bytes) routed through the race-free in-band-END path.
+        /// Covers every length that can fully prefill the 8-deep TX FIFO before
+        /// the controller clocks (`FIFO_DEPTH + 1 = 9`).
+        const INBAND_END_MAX_LEN: usize = 9;
+
+        if buf.is_empty() {
+            return Err(IOError::Other);
+        }
+
+        let mdb = ibi.first().copied().unwrap_or_else(|| *buf.first().unwrap_or(&0));
+
+        if buf.len() <= INBAND_END_MAX_LEN {
+            // Expand each byte to a 32-bit SWDATAB word on the stack; the
+            // in-band path ORs END/END_ALSO into the final word.
+            let mut words = [0u32; INBAND_END_MAX_LEN];
+            let Some(slot) = words.get_mut(..buf.len()) else {
+                return Err(IOError::Other);
+            };
+            for (w, &b) in slot.iter_mut().zip(buf) {
+                *w = b as u32;
+            }
+            self.dma_respond_to_read_with_ibi_inband_end(slot, mdb).await
+        } else {
+            self.dma_respond_to_read_with_ibi_tcd(buf, mdb).await
+        }
+    }
+
+    /// IBI + directed read via a 4x word-expanded `SWDATAB` stream: each byte
+    /// becomes a 32-bit word and the final word carries the in-band END /
+    /// END_ALSO markers, so HW emits end-of-data without any `SWDATABE` write.
+    ///
+    /// Single TCD, no scatter-gather — so there is no chain hand-off that can
+    /// over-write a full TX FIFO; every write stays request-paced by
+    /// `TXNOTFULL`. This makes it race-free at the FIFO boundary at the cost of
+    /// 4x staging RAM. Used by [`Self::dma_respond_to_read_with_ibi`] for small
+    /// payloads.
+    pub async fn dma_respond_to_read_with_ibi_inband_end(&mut self, buf: &mut [u32], mdb: u8) -> Result<(), IOError> {
         if buf.is_empty() {
             return Err(IOError::Other);
         }
@@ -774,10 +1108,27 @@ impl<'d> I3c<'d> {
             return Err(IOError::IbiDisabled);
         }
 
-        // Pre-arm the DMA TX path. Mirrors the controller's `async_write`:
-        // DMA streams `len-1` bytes through SWDATAB1; SW writes the last
-        // byte to SWDATABE to mark end-of-data.
-        let (last, rest) = buf.split_last().unwrap();
+        // Build a 4x-expanded word buffer driven entirely by DMA. Each
+        // input byte becomes one 32-bit word written to `SWDATAB` (offset
+        // 0x30): bits 0-7 carry the data byte, bit 8 (`end`) and bit 16
+        // (`end_also`) both flag "last byte" — everything else is
+        // reserved. The final word ORs in `end | end_also` so the HW
+        // emits the I3C end-of-data marker without any SW write to
+        // `SWDATABE`.
+        //
+
+        let last_idx = buf.len() - 1;
+        // Bit 8 = end, bit 16 = end_also. Both mean "last byte"; we
+        // set both to match the SWDATAB-via-CPU convention.
+        buf[last_idx] |= (1u32 << 8) | (1u32 << 16);
+
+        // Log last index and alst index value
+        #[cfg(feature = "defmt")]
+        defmt::trace!(
+            "dma_respond_to_read_with_ibi_inband_end: last_idx={}, last_val={:08x}",
+            last_idx,
+            buf[last_idx]
+        );
 
         // Cleanup guard for any early exit (cancellation, error).
         let info = self.info;
@@ -790,8 +1141,41 @@ impl<'d> I3c<'d> {
             });
         });
 
-        if !rest.is_empty() {
-            self.dma_tx_arm(rest)?;
+        #[cfg(feature = "defmt")]
+        // lig buffer address as u32 hex to avoid printing a pointer (which is not supported on all platforms).
+        defmt::trace!(
+            "Pre-arming IBI DMA (len={}, buf={:08x})",
+            buf.len(),
+            buf.as_ptr() as u32
+        );
+
+        // Arm DMA: 32-bit word-wide writes from `words` directly into
+        // SWDATAB. The peripheral handshake stays byte-paced
+        // (`SDMACTRL.dmawidth = Byte0`) — that controls when the I3C IP
+        // re-asserts the DMA request, not the eDMA transfer width.
+        let peri_addr = self.info.regs().swdatab().as_ptr() as *mut u32;
+        unsafe {
+            self.tx_dma.disable_request();
+            self.tx_dma.clear_done();
+            self.tx_dma.clear_interrupt();
+            self.tx_dma.set_request_source(self.tx_request);
+            self.tx_dma.setup_write_to_peripheral::<u32, u32>(
+                buf,
+                peri_addr,
+                false,
+                TransferOptions {
+                    half_transfer_interrupt: false,
+                    complete_transfer_interrupt: true,
+                    priority: crate::dma::Priority::HIGHEST,
+                },
+            )?;
+
+            self.info.regs().sdmactrl().modify(|w| {
+                w.set_dmatb(SdmactrlDmatb::Enable);
+                w.set_dmawidth(SdmactrlDmawidth::Byte0);
+            });
+
+            self.tx_dma.enable_request();
         }
 
         // Make sure the bus is actually idle before raising the IBI.
@@ -815,6 +1199,9 @@ impl<'d> I3c<'d> {
         // to BBQ internals.
         let stop_seq_pre = self.bbq_state.stop_seq.load(Ordering::Acquire);
 
+        #[cfg(feature = "defmt")]
+        defmt::trace!("Raising IBI (len={}, dma=true)", buf.len());
+
         // Raise the IBI. DMA is already armed and the request line enabled;
         // HW will push bytes into the TX FIFO as soon as TXNOTFULL is true.
         // Raising IBI without first awaiting DMA completion is required for
@@ -828,42 +1215,40 @@ impl<'d> I3c<'d> {
         // EVENT=Ibi, mirroring SDK's `I3C_SlaveRequestIBIWithData`. The
         // MDB is sourced from SCTRL.IBIDATA (out-of-band from the TX
         // FIFO); leaving it stale means a bogus MDB on the wire.
-        let mdb = *buf.first().unwrap_or(&0);
         self.info.regs().sctrl().modify(|w| {
-            w.set_ibidata(mdb);
+            w.set_ibidata(mdb as u8);
             w.set_event(SctrlEvent::Ibi);
         });
 
-        // Wait for DMA to drain `rest` into the FIFO. Safe to await here:
-        // the controller is now draining the FIFO so DMA always makes
-        // progress to completion.
-        if !rest.is_empty() {
-            poll_fn(|cx| {
-                let _ = self.tx_dma.wait_cell().poll_wait(cx);
-                if self.tx_dma.is_done() {
-                    Poll::Ready(())
-                } else {
-                    Poll::Pending
-                }
-            })
-            .await;
+        #[cfg(feature = "defmt")]
+        defmt::trace!("IBI raised, waiting for DMA to drain");
 
-            cortex_m::asm::dsb();
-
-            self.info
-                .regs()
-                .sdmactrl()
-                .modify(|w| w.set_dmatb(SdmactrlDmatb::NotUsed));
-            unsafe {
-                self.tx_dma.disable_request();
-                self.tx_dma.clear_done();
+        // Wait for DMA to drain every word (including the end-flag one)
+        // into the FIFO. The controller is draining concurrently so DMA
+        // always makes progress to completion.
+        poll_fn(|cx| {
+            let _ = self.tx_dma.wait_cell().poll_wait(cx);
+            if self.tx_dma.is_done() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
             }
-        }
+        })
+        .await;
 
-        // Push the final byte to SWDATABE so HW emits the end-of-data
-        // marker (T-bit) and the controller terminates the read cleanly.
-        self.wait_tx_space().await?;
-        self.info.regs().swdatabe().write(|w| w.set_data(*last));
+        #[cfg(feature = "defmt")]
+        defmt::trace!("DMA drained, waiting for controller to Stop");
+
+        cortex_m::asm::dsb();
+
+        self.info
+            .regs()
+            .sdmactrl()
+            .modify(|w| w.set_dmatb(SdmactrlDmatb::NotUsed));
+        unsafe {
+            self.tx_dma.disable_request();
+            self.tx_dma.clear_done();
+        }
 
         // Wait for the controller to complete the IBI handshake +
         // directed read and emit Stop. The BBQ IRQ bumps `stop_seq`
@@ -892,6 +1277,286 @@ impl<'d> I3c<'d> {
         // RDTERM and separated by Sr or Stop). Every chunk boundary that
         // falls mid-T=1-stream latches SERRWARN.TERM on the target, even
         // though the IP keeps draining the TX FIFO across the Sr. By the
+        // time we reach this check, DMA has streamed every word (with the
+        // final word carrying `end|end_also`) into the FIFO, so the
+        // wire-level payload is fully delivered regardless of how many
+        // TERM warnings got latched along the way. Mirrors
+        // `dma_respond_to_read`, which exposes the same condition as
+        // `ReadStatus::EarlyStop`.
+        //
+        // Genuine controller-side aborts (mid-payload Stop with bytes
+        // still pending in DMA) surface earlier as Underrun/UnderrunNack
+        // on the SDMACTRL TX path, not here.
+        //
+        // `InvalidStart` is suppressed for the same reason as `Terminated`: it
+        // is a transient bus glitch (controller started the next transaction
+        // immediately after our Stop) that does not invalidate the already-
+        // delivered payload.
+        match self.check_status() {
+            Ok(()) | Err(IOError::Terminated) | Err(IOError::InvalidStart) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Respond to a controller directed read while raising an IBI, with the
+    /// payload streamed by DMA (primary path).
+    ///
+    /// Builds a 2-TCD scatter-gather chain: the first `len-1` bytes stream to
+    /// `SWDATAB1`, then ESG loads a 1-iteration TCD that writes the final byte
+    /// to `SWDATABE`, so HW emits the end-of-data marker without a CPU write.
+    /// The IBI is raised after arming, and we wait for the **whole chain** to
+    /// drain (CH_CSR.DONE is set only when the final ESG=0 TCD completes) before
+    /// tearing down `dmatb` — disabling it earlier starves the FIFO and the
+    /// target underruns. Tolerates repeated-START reads: the FIFO keeps draining
+    /// across each `Sr`, and the benign `SERRWARN.TERM` is suppressed.
+    ///
+    /// `buf` must be non-empty.
+    pub async fn dma_respond_to_read_with_ibi_tcd(&mut self, buf: &[u8], mdb: u8) -> Result<(), IOError> {
+        if buf.is_empty() {
+            return Err(IOError::Other);
+        }
+
+        if self.info.regs().sstatus().read().ibidis() == Ibidis::InterruptsDisabled {
+            return Err(IOError::IbiDisabled);
+        }
+
+        let (last, rest) = buf.split_last().ok_or(IOError::Other)?;
+
+        use crate::dma;
+        use core::sync::atomic::{Ordering, fence};
+
+        // Cleanup guard for any early exit (cancellation, error).
+        let info = self.info;
+        let regs_ptr = info.regs();
+        let _ibi_drop = OnDrop::new(|| {
+            regs_ptr.sctrl().modify(|w| w.set_event(SctrlEvent::NormalMode));
+            regs_ptr.sdmactrl().modify(|w| {
+                w.set_dmatb(SdmactrlDmatb::NotUsed);
+                w.set_dmafb(SdmactrlDmafb::NotUsed);
+            });
+        });
+
+        // Create TCDs
+        #[repr(align(32))]
+        struct AlignedTcds([crate::dma::Tcd; 2]);
+
+        let mut tcds = AlignedTcds([crate::dma::Tcd::default(); 2]);
+        let mut index = 0;
+
+        // Build a scatter-gather list for the DMA transfer. The first N-1 bytes are streamed through SWDATAB1,
+        // and the final byte is written to SWDATABE to mark the end of the transfer. This allows the DMA to handle the bulk of the data transfer while
+        // Add the first N-1 bytes to the scatter-gather list, streaming them
+        // through SWDATAB1.
+        if !rest.is_empty() {
+            let swdatab1_addr = self.info.regs().swdatab1().as_ptr() as u32;
+            tcds.0[index].saddr = rest.as_ptr() as u32;
+            tcds.0[index].soff = 1;
+            tcds.0[index].daddr = swdatab1_addr;
+            tcds.0[index].doff = 0;
+            tcds.0[index].attr = 0; // Set appropriate attributes for the transfer
+            tcds.0[index].nbytes = 1;
+            tcds.0[index].citer = rest.len() as u16;
+            tcds.0[index].dlast_sga = &tcds.0[index + 1] as *const dma::Tcd as i32;
+            // Look into csr
+            tcds.0[index].csr = 0x10; // Set appropriate control and status flags
+            tcds.0[index].biter = rest.len() as u16;
+            index += 1;
+        }
+
+        // Add the final byte to the scatter-gather list, writing it to SWDATABE to mark the end of the transfer.
+        let last_byte_buf = [*last];
+        let swdatabe_addr = self.info.regs().swdatabe().as_ptr() as u32;
+        tcds.0[index].saddr = last_byte_buf.as_ptr() as u32;
+        tcds.0[index].soff = 0;
+        tcds.0[index].daddr = swdatabe_addr as u32;
+        tcds.0[index].doff = 0;
+        tcds.0[index].attr = 0; // Set appropriate attributes for the transfer
+        tcds.0[index].nbytes = 1;
+        tcds.0[index].citer = 1;
+        tcds.0[index].dlast_sga = 0;
+        tcds.0[index].csr = 0xA; // Set appropriate control and status flags
+        tcds.0[index].biter = 1;
+
+        let tcd = self.tx_dma.tcd();
+        DmaChannel::reset_channel_state(&tcd);
+
+        // Ensure channel state is reset before loading TCDs into the DMA controller.
+        fence(Ordering::Release);
+
+        unsafe {
+            self.tx_dma.load_tcd(&tcds.0[0]);
+        }
+
+        self.info.regs().sdmactrl().modify(|w| {
+            w.set_dmatb(SdmactrlDmatb::Enable);
+            w.set_dmawidth(SdmactrlDmawidth::Byte0);
+        });
+
+        unsafe {
+            self.tx_dma.set_request_source(self.tx_request);
+        }
+
+        // Ensure that all memory operations are completed before enabling the DMA request.
+        fence(Ordering::Release);
+
+        #[cfg(feature = "defmt")]
+        defmt::trace!("Starting scatter-gather DMA transfer");
+
+        // Make sure the bus is actually idle before raising the IBI.
+        // Phase A (`dma_respond_to_write`) is supposed to have waited for
+        // end-of-chain, but if the caller skipped that step we'd race the
+        // controller's Stop emission and corrupt this IBI.
+        self.wait_for_end_of_chain().await?;
+
+        // Clear any stale Stop flag so the post-IBI wait below observes
+        // the *new* Stop the controller emits after this IBI, not the
+        // pre-IBI bus-idle state.
+        self.info.regs().sstatus().write(|w| w.set_stop(true));
+
+        // Snapshot the BBQ IRQ's stop counter. The BBQ IRQ owns the
+        // latched STOP flag (it W1Cs it as part of its rotation logic),
+        // so neither `wait_for_end_of_chain` (level-triggered on
+        // STNOTSTOP, which is already `Stopped` here) nor a direct poll
+        // of `SSTATUS.STOP` would reliably catch the post-IBI Stop. The
+        // counter is bumped from the IRQ after each W1C, giving us a
+        // race-free way to wait for the next bus-end without coupling
+        // to BBQ internals.
+        let stop_seq_pre = self.bbq_state.stop_seq.load(Ordering::Acquire);
+
+        unsafe {
+            self.tx_dma.enable_request();
+        }
+
+        // EXPERIMENT 3: sample the chain state during the IDLE prefill, BEFORE
+        // raising the IBI (controller cannot be draining yet). If TCD1 completes
+        // here (is_done) with the FIFO full, it fired into the full FIFO without
+        // any drain -> not request/drain-gated (ESG residual-request bug), not a
+        // silicon drop of a properly-gated byte.
+        #[cfg(feature = "defmt")]
+        {
+            let ch = self.tx_dma.tcd();
+            let dc0 = self.info.regs().sdatactrl().read();
+            let done0 = self.tx_dma.is_done();
+            // brief settle to let the prefill burst finish, then re-sample
+            cortex_m::asm::delay(2000);
+            let dc1 = self.info.regs().sdatactrl().read();
+            defmt::info!(
+                "[pre-ibi] len={} t0:done={} txcount={} txfull={}  t1:done={} txcount={} txfull={} ch_done={} citer={} tcd_csr={:#06x}",
+                buf.len(),
+                done0,
+                dc0.txcount(),
+                dc0.txfull(),
+                self.tx_dma.is_done(),
+                dc1.txcount(),
+                dc1.txfull(),
+                ch.ch_csr().read().done(),
+                ch.tcd_citer_elinkno().read().citer(),
+                ch.tcd_csr().read().0,
+            );
+        }
+
+        #[cfg(feature = "defmt")]
+        defmt::trace!("Raising IBI (len={}, dma={})", buf.len(), !rest.is_empty());
+
+        // Raise the IBI. DMA is already armed and the request line enabled;
+        // HW will push bytes into the TX FIFO as soon as TXNOTFULL is true.
+        // Raising IBI without first awaiting DMA completion is required for
+        // payloads larger than the TX FIFO depth (8 bytes): in that case the
+        // first 8 bytes would fill the FIFO and DMA would stall waiting for
+        // space — but the controller hasn't started clocking yet, so it
+        // never drains. Raising IBI here lets the controller ack and start
+        // pulling bytes, which unblocks DMA so it can stream the remainder.
+        //
+        // Set IBIDATA (MDB byte sent on the IBI) in the SAME write as
+        // EVENT=Ibi, mirroring SDK's `I3C_SlaveRequestIBIWithData`. The
+        // MDB is sourced from SCTRL.IBIDATA (out-of-band from the TX
+        // FIFO); leaving it stale means a bogus MDB on the wire.
+        self.info.regs().sctrl().modify(|w| {
+            w.set_ibidata(mdb);
+            w.set_event(SctrlEvent::Ibi);
+        });
+
+        #[cfg(feature = "defmt")]
+        defmt::trace!("Waiting for scatter-gather DMA transfer to complete");
+
+        // Wait for the FULL scatter-gather chain to drain. With ESG, CH_CSR.DONE
+        // is set only when the final TCD (the SWDATABE byte, ESG=0) completes —
+        // TCD0 completing just loads TCD1. INTMAJOR on the last TCD wakes us.
+        // Disabling dmatb before this would starve the body after the FIFO
+        // prefill -> target underrun.
+        poll_fn(|cx| {
+            let _ = self.tx_dma.wait_cell().poll_wait(cx);
+            if self.tx_dma.is_done() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
+
+        #[cfg(feature = "defmt")]
+        defmt::trace!("Scatter-gather DMA transfer completed");
+
+        #[cfg(feature = "defmt")]
+        {
+            let ch = self.tx_dma.tcd();
+            let ew = self.info.regs().serrwarn().read();
+            let dc = self.info.regs().sdatactrl().read();
+            defmt::info!(
+                "[tcd9] len={} dma_done={} citer={} biter={} ch_done={} ch_es={:#010x} tcd_csr={:#06x} txcount={} txfull={} serrwarn={:#010x} owrite={} urun={} orun={} term={}",
+                buf.len(),
+                self.tx_dma.is_done(),
+                ch.tcd_citer_elinkno().read().citer(),
+                ch.tcd_biter_elinkno().read().biter(),
+                ch.ch_csr().read().done(),
+                ch.ch_es().read().0,
+                ch.tcd_csr().read().0,
+                dc.txcount(),
+                dc.txfull(),
+                ew.0,
+                ew.owrite(),
+                ew.urun(),
+                ew.orun(),
+                ew.term(),
+            );
+        }
+
+        // Wait for the controller to complete the IBI handshake +
+        // directed read and emit Stop. The BBQ IRQ bumps `stop_seq`
+        // after W1C'ing each STOP latch; loop until it advances or an
+        // error/warning surfaces.
+        self.info
+            .wait_cell()
+            .wait_for(|| {
+                self.info.regs().sintset().write(|w| {
+                    w.set_errwarn(true);
+                    w.set_stop(true);
+                });
+
+                let status = self.info.regs().sstatus().read();
+                #[cfg(feature = "defmt")]
+                defmt::trace!("IBI status: {:?}", status);
+
+                status.errwarn() || self.bbq_state.stop_seq.load(Ordering::Acquire) != stop_seq_pre
+            })
+            .await
+            .map_err(|_| IOError::Other)?;
+
+        self.info
+            .regs()
+            .sdmactrl()
+            .modify(|w| w.set_dmatb(SdmactrlDmatb::NotUsed));
+
+        // Force EVENT back to NormalMode in case HW didn't pulse.
+        self.info.regs().sctrl().modify(|w| w.set_event(SctrlEvent::NormalMode));
+
+        _ibi_drop.defuse();
+
+        // Treat `Terminated` as success: the controller is free to chunk this
+        // logical response into multiple wire-level reads (each bounded by
+        // RDTERM and separated by Sr or Stop). Every chunk boundary that
+        // falls mid-T=1-stream latches SERRWARN.TERM on the target, even
+        // though the IP keeps draining the TX FIFO across the Sr. By the
         // time we reach this check, DMA has streamed `rest` into the FIFO
         // and SWDATABE has emitted the final T=0 byte — so the wire-level
         // payload is fully delivered regardless of how many TERM warnings
@@ -901,8 +1566,110 @@ impl<'d> I3c<'d> {
         // Genuine controller-side aborts (mid-payload Stop with bytes still
         // pending in DMA) surface earlier as Underrun/UnderrunNack on the
         // `wait_tx_space` / SWDATABE path, not here.
+        //
+        // `InvalidStart` is suppressed for the same reason as `Terminated`: a
+        // transient bus glitch at the tail of a completed transfer.
         match self.check_status() {
-            Ok(()) | Err(IOError::Terminated) => Ok(()),
+            Ok(()) | Err(IOError::Terminated) | Err(IOError::InvalidStart) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// IBI + directed read whose payload is streamed by a `ScatterGatherBuilder`
+    /// chain: body `len-1` bytes -> `SWDATAB1`, final byte -> `SWDATABE` (HW end
+    /// marker). Same wire behavior as [`Self::dma_respond_to_read_with_ibi_tcd`]
+    /// but built via the public, request-paced `build_borrowed`.
+    ///
+    /// `buf` must be non-empty.
+    pub async fn dma_respond_to_read_with_ibi_sg(&mut self, buf: &[u8], mdb: u8) -> Result<(), IOError> {
+        if buf.is_empty() {
+            return Err(IOError::Other);
+        }
+        if self.info.regs().sstatus().read().ibidis() == Ibidis::InterruptsDisabled {
+            return Err(IOError::IbiDisabled);
+        }
+        let Some((last, rest)) = buf.split_last() else {
+            return Err(IOError::Other);
+        };
+        let last_buf = [*last]; // local: lives until the transfer drains below
+        let swdatab1 = self.info.regs().swdatab1().as_ptr() as *mut u8;
+        let swdatabe = self.info.regs().swdatabe().as_ptr() as *mut u8;
+
+        let info = self.info;
+        let bbq = self.bbq_state;
+        let regs_ptr = info.regs();
+        let _ibi_drop = OnDrop::new(|| {
+            regs_ptr.sctrl().modify(|w| w.set_event(SctrlEvent::NormalMode));
+            regs_ptr.sdmactrl().modify(|w| {
+                w.set_dmatb(SdmactrlDmatb::NotUsed);
+                w.set_dmafb(SdmactrlDmafb::NotUsed);
+            });
+        });
+
+        // Build body -> SWDATAB1, final byte -> SWDATABE.
+        let mut sg = crate::dma::ScatterGatherBuilder::<u8>::new();
+        if !rest.is_empty() {
+            sg.add_transfer_segment(crate::dma::ScatterGatherTransfer::mem_to_peripheral(rest, swdatab1))
+                .map_err(|_| IOError::Other)?;
+        }
+        sg.add_transfer_segment(crate::dma::ScatterGatherTransfer::mem_to_peripheral(
+            &last_buf, swdatabe,
+        ))
+        .map_err(|_| IOError::Other)?;
+
+        unsafe {
+            self.tx_dma.set_request_source(self.tx_request);
+        }
+        info.regs().sdmactrl().modify(|w| {
+            w.set_dmatb(SdmactrlDmatb::Enable);
+            w.set_dmawidth(SdmactrlDmawidth::Byte0);
+        });
+
+        // Arm the chain request-paced (ERQ on, no START).
+        let transfer = sg.build_borrowed(&mut self.tx_dma).map_err(|_| IOError::Other)?;
+
+        // Bus idle, then raise IBI — all via `info`/regs so `self` stays free
+        // while `transfer` borrows `tx_dma`.
+        info.wait_cell()
+            .wait_for(|| info.regs().sstatus().read().stnotstop() == Stnotstop::Stopped)
+            .await
+            .map_err(|_| IOError::Other)?;
+        info.regs().sstatus().write(|w| w.set_stop(true));
+        let stop_seq_pre = bbq.stop_seq.load(Ordering::Acquire);
+
+        info.regs().sctrl().modify(|w| {
+            w.set_ibidata(mdb);
+            w.set_event(SctrlEvent::Ibi);
+        });
+
+        // Wait for the full chain to drain before tearing down dmatb.
+        let wait_result = transfer.await;
+        if let Err(e) = wait_result {
+            #[cfg(feature = "defmt")]
+            defmt::error!("Scatter-gather DMA transfer failed: {:?}", e);
+            return Err(IOError::Other);
+        }
+
+        cortex_m::asm::dsb();
+        info.regs().sdmactrl().modify(|w| w.set_dmatb(SdmactrlDmatb::NotUsed));
+
+        info.wait_cell()
+            .wait_for(|| {
+                info.regs().sintset().write(|w| {
+                    w.set_errwarn(true);
+                    w.set_stop(true);
+                });
+                info.regs().sstatus().read().errwarn() || bbq.stop_seq.load(Ordering::Acquire) != stop_seq_pre
+            })
+            .await
+            .map_err(|_| IOError::Other)?;
+
+        info.regs().sctrl().modify(|w| w.set_event(SctrlEvent::NormalMode));
+        _ibi_drop.defuse();
+
+        // `InvalidStart` suppressed for the same reason as `Terminated`.
+        match self.check_status() {
+            Ok(()) | Err(IOError::Terminated) | Err(IOError::InvalidStart) => Ok(()),
             Err(e) => Err(e),
         }
     }
@@ -966,7 +1733,9 @@ impl<'d> I3c<'d> {
     /// SW-write the last byte to `SWDATABE`). Returns the number of bytes
     /// the DMA shipped before the SW end-byte (== `buf.len() - 1`).
     async fn dma_tx_run(&mut self, buf: &[u8]) -> Result<usize, IOError> {
-        let (last, rest) = buf.split_last().unwrap();
+        let Some((last, rest)) = buf.split_last() else {
+            return Err(IOError::Other);
+        };
         let regs_ptr = self.info.regs();
         let _drop = OnDrop::new(|| {
             regs_ptr.sdmactrl().modify(|w| w.set_dmatb(SdmactrlDmatb::NotUsed));
@@ -1077,7 +1846,6 @@ impl<'d> I3c<'d> {
                         w.set_start(true);
                         w.set_matched(true);
                         w.set_stop(true);
-                        w.set_rxpend(true);
                         w.set_dachg(true);
                         w.set_ccc(true);
                         w.set_ddrmatched(true);
@@ -1104,7 +1872,6 @@ impl<'d> I3c<'d> {
                         || status.chandled()
                         || status.dachg()
                         || status.event()
-                        || status.rx_pend()
                         || self.bbq_state.has_pending()
                         || (status.txnotfull() == SstatusTxnotfull::NotFull && status.streqrd() == Streqrd::Busy)
                 })
@@ -1146,8 +1913,18 @@ impl<'d> I3c<'d> {
                 return Ok(Event::Start);
             }
             if status.ccc() {
+                // Unhandled (vendor/broadcast) CCC. Per the reference manual the
+                // command code + any payload arrive via the RX path and are only
+                // committed to the BBQ at the transaction STOP — they are *not*
+                // readable here yet, and the RX DMA owns the FIFO so we must not
+                // touch it. So we don't read the queue at all: just latch that
+                // this transaction is a CCC, W1C the flag, and let the frame
+                // surface as `Event::Ccc` (in place of `RxPending`) at the
+                // `has_pending` branch once committed. The caller then reads the
+                // frame normally, with the CCC command code as the first byte.
                 self.info.regs().sstatus().write(|w| w.set_ccc(true));
-                return Ok(Event::Ccc);
+                self.ccc_pending = true;
+                continue;
             }
             if status.matched() {
                 self.info.regs().sstatus().write(|w| w.set_matched(true));
@@ -1176,7 +1953,11 @@ impl<'d> I3c<'d> {
                 return Ok(Event::TxPending);
             }
             if status.rx_pend() || self.bbq_state.has_pending() {
-                return Ok(Event::RxPending);
+                // A CCC transaction surfaces here in place of `RxPending` once
+                // its frame is committed. Level-triggered like `RxPending`: the
+                // latch is cleared by the read that drains the frame (see
+                // `dma_respond_to_write`), so `Event::Ccc` re-fires until read.
+                return Ok(if self.ccc_pending { Event::Ccc } else { Event::RxPending });
             }
             if status.chandled() {
                 self.info.regs().sstatus().write(|w| w.set_chandled(true));
@@ -1188,10 +1969,15 @@ impl<'d> I3c<'d> {
             }
             if status.event() {
                 self.info.regs().sstatus().write(|w| w.set_event(true));
-                return Ok(Event::EventStatusChanged);
+                return Ok(Event::EventStatusChanged(status.evdet()));
             }
             if status.stop() {
                 self.info.regs().sstatus().write(|w| w.set_stop(true));
+                // Clear any stale CCC latch. On a committed CCC the read already
+                // cleared it; this also covers a torn CCC (flag fired but no
+                // commit) so it can't mislabel the next transaction. A repeated
+                // START (Sr) does not reset it, so direct CCCs stay intact.
+                self.ccc_pending = false;
                 // Disable TX-ready on end-of-chain. Defensive: the
                 // `async_respond_to_read` OnDrop normally handles this, but if
                 // the read never started (e.g. controller aborted) leaving it

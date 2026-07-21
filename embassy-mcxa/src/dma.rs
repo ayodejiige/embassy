@@ -566,7 +566,7 @@ impl DmaChannel<'_> {
     }
 
     #[inline]
-    fn reset_channel_state(t: &pac::edma_tcd::Tcd) {
+    pub fn reset_channel_state(t: &pac::edma_tcd::Tcd) {
         // CSR: Resets to all zeroes (disabled), "done" is cleared by writing 1
         t.ch_csr().write(|w| w.set_done(true));
         // ES: Resets to all zeroes (disabled), "err" is cleared by writing 1
@@ -1264,7 +1264,7 @@ impl DmaChannel<'_> {
     ///
     /// - The TCD must be properly initialized.
     /// - The caller must ensure no concurrent access to the same channel.
-    unsafe fn load_tcd(&self, tcd: &Tcd) {
+    pub(crate) unsafe fn load_tcd(&self, tcd: &Tcd) {
         let t = self.tcd();
         t.tcd_saddr().write(|w| w.set_saddr(tcd.saddr));
         t.tcd_soff().write(|w| w.set_soff(tcd.soff as u16));
@@ -1286,7 +1286,7 @@ impl DmaChannel<'_> {
 #[repr(C, align(32))]
 #[derive(Clone, Copy, Debug, Default)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-struct Tcd {
+pub(crate) struct Tcd {
     pub saddr: u32,
     pub soff: i16,
     pub attr: u16,
@@ -1962,6 +1962,33 @@ impl<'a> DmaChannel<'a> {
 /// Maximum number of TCDs in a scatter-gather chain.
 pub(crate) const MAX_SCATTER_GATHER_TCDS: usize = 16;
 
+/// A single segment in a scatter-gather transfer chain.
+pub enum ScatterGatherTransfer<'a, W: Word> {
+    /// Memory-to-memory copy.
+    MemToMem { src: &'a [W], dst: &'a mut [W] },
+    /// Memory-to-peripheral write.
+    MemToPeripheral { src: &'a [W], peri_addr: *mut W },
+    /// Peripheral-to-memory read.
+    PeripheralToMem { peri_addr: *const W, dst: &'a mut [W] },
+}
+
+impl<'a, W: Word> ScatterGatherTransfer<'a, W> {
+    /// Create a memory-to-memory segment.
+    pub fn mem_to_mem(src: &'a [W], dst: &'a mut [W]) -> Self {
+        Self::MemToMem { src, dst }
+    }
+
+    /// Create a memory-to-peripheral segment.
+    pub fn mem_to_peripheral(src: &'a [W], peri_addr: *mut W) -> Self {
+        Self::MemToPeripheral { src, peri_addr }
+    }
+
+    /// Create a peripheral-to-memory segment.
+    pub fn peripheral_to_mem(peri_addr: *const W, dst: &'a mut [W]) -> Self {
+        Self::PeripheralToMem { peri_addr, dst }
+    }
+}
+
 /// A builder for constructing scatter-gather DMA transfer chains.
 ///
 /// This provides a type-safe way to build TCD chains for scatter-gather
@@ -2016,6 +2043,10 @@ pub struct ScatterGatherBuilder<'a, W: Word> {
     tcds: [Tcd; MAX_SCATTER_GATHER_TCDS],
     /// Number of TCDs configured
     count: usize,
+    /// True once any peripheral (Mem<->Peripheral) segment is added. Determines
+    /// the kickoff mode: peripheral chains are hardware-request (`ERQ`) paced,
+    /// mem-to-mem chains are software (`START`) driven.
+    peripheral_paced: bool,
     /// Phantom marker for word type
     _phantom: core::marker::PhantomData<W>,
 
@@ -2028,6 +2059,7 @@ impl<'a, W: Word> ScatterGatherBuilder<'a, W> {
         ScatterGatherBuilder {
             tcds: [Tcd::default(); MAX_SCATTER_GATHER_TCDS],
             count: 0,
+            peripheral_paced: false,
             _phantom: core::marker::PhantomData,
             _plt: core::marker::PhantomData,
         }
@@ -2072,12 +2104,149 @@ impl<'a, W: Word> ScatterGatherBuilder<'a, W> {
         self
     }
 
+    /// Add a transfer segment to the scatter-gather chain.
+    ///
+    /// This returns an error instead of panicking when the builder is full or
+    /// the segment parameters are invalid.
+    pub fn add_transfer_segment<'b: 'a>(
+        &mut self,
+        segment: ScatterGatherTransfer<'b, W>,
+    ) -> Result<&mut Self, InvalidParameters> {
+        if self.count >= MAX_SCATTER_GATHER_TCDS {
+            return Err(InvalidParameters);
+        }
+
+        let size = W::size();
+        let byte_size = size.bytes();
+        let hw_size = size.to_hw_size();
+
+        let tcd = self.tcds.get_mut(self.count).ok_or(InvalidParameters)?;
+
+        *tcd = Tcd {
+            saddr: 0,
+            soff: 0,
+            attr: ((hw_size as u16) << 8) | (hw_size as u16),
+            nbytes: 0,
+            slast: 0,
+            daddr: 0,
+            doff: 0,
+            citer: 1,
+            dlast_sga: 0,
+            csr: 0x0002,
+            biter: 1,
+        };
+
+        match segment {
+            ScatterGatherTransfer::MemToMem { src, dst } => {
+                if src.is_empty() || src.len() > dst.len() || src.len() > DMA_MAX_TRANSFER_SIZE {
+                    return Err(InvalidParameters);
+                }
+
+                tcd.saddr = src.as_ptr() as u32;
+                tcd.soff = byte_size as i16;
+                tcd.nbytes = (src.len() * byte_size) as u32;
+                tcd.daddr = dst.as_mut_ptr() as u32;
+                tcd.doff = byte_size as i16;
+            }
+            ScatterGatherTransfer::MemToPeripheral { src, peri_addr } => {
+                if src.is_empty() || src.len() > DMA_MAX_TRANSFER_SIZE {
+                    return Err(InvalidParameters);
+                }
+
+                tcd.saddr = src.as_ptr() as u32;
+                tcd.soff = byte_size as i16;
+                tcd.nbytes = (src.len() * byte_size) as u32;
+                tcd.daddr = peri_addr as u32;
+                tcd.doff = 0;
+                self.peripheral_paced = true;
+            }
+            ScatterGatherTransfer::PeripheralToMem { peri_addr, dst } => {
+                if dst.is_empty() || dst.len() > DMA_MAX_TRANSFER_SIZE {
+                    return Err(InvalidParameters);
+                }
+
+                tcd.saddr = peri_addr as u32;
+                tcd.soff = 0;
+                tcd.nbytes = (dst.len() * byte_size) as u32;
+                tcd.daddr = dst.as_mut_ptr() as u32;
+                tcd.doff = byte_size as i16;
+                self.peripheral_paced = true;
+            }
+        }
+
+        self.count += 1;
+        Ok(self)
+    }
+
     /// Get the number of transfer segments added.
     pub fn segment_count(&self) -> usize {
         self.count
     }
 
+    /// Link the TCD chain, load TCD0, and kick off the channel.
+    ///
+    /// The kickoff mode is derived from the transfer type:
+    /// - **peripheral-paced** (any Mem<->Peripheral segment): enable `ERQ`; the
+    ///   first TCD and every ESG-loaded TCD run under hardware requests (no
+    ///   `START` on linked TCDs).
+    /// - **mem-to-mem**: software `START` on the first TCD; linked TCDs carry
+    ///   `START` so they auto-execute when ESG loads them.
+    ///
+    /// CSR bits: START=0x1, INTMAJOR=0x2, ESG=0x10.
+    fn arm(&mut self, channel: &DmaChannel<'_>) -> Result<(), Error> {
+        if self.count == 0 {
+            return Err(Error::Configuration);
+        }
+        let periph = self.peripheral_paced;
+
+        for i in 0..self.count {
+            let is_first = i == 0;
+            let is_last = i == self.count - 1;
+            let dlast_sga = if is_last {
+                0
+            } else {
+                self.tcds.get(i + 1).ok_or(Error::Configuration)? as *const Tcd as i32
+            };
+
+            let tcd = self.tcds.get_mut(i).ok_or(Error::Configuration)?;
+            tcd.dlast_sga = dlast_sga;
+
+            let mut csr = 0x0002u16; // INTMAJOR
+            if !is_last {
+                csr |= 0x0010; // ESG -> link to next TCD
+            }
+            // mem-to-mem: ESG-loaded TCDs need START to auto-execute. The first
+            // TCD is started below (software START / ERQ), so it never carries
+            // START here. Peripheral chains are request-paced -> never START.
+            if !periph && !is_first {
+                csr |= 0x0001;
+            }
+            tcd.csr = csr;
+        }
+
+        let t = channel.tcd();
+        DmaChannel::reset_channel_state(&t);
+        cortex_m::asm::dsb();
+        // SAFETY: TCD pool is valid and 32-byte aligned; channel is exclusive.
+        unsafe { channel.load_tcd(self.tcds.get(0).ok_or(Error::Configuration)?) };
+        cortex_m::asm::dsb();
+
+        if periph {
+            t.ch_csr().modify(|w| {
+                w.set_erq(true);
+                w.set_earq(true);
+            });
+        } else {
+            t.tcd_csr().modify(|w| w.set_start(Start::ChannelStarted));
+        }
+        Ok(())
+    }
+
     /// Build the scatter-gather chain and start the transfer.
+    ///
+    /// Kickoff (software `START` vs hardware `ERQ`) is chosen automatically from
+    /// the segment types: mem-to-mem chains start in software, peripheral chains
+    /// run request-paced. See [`Self::arm`].
     ///
     /// # Arguments
     ///
@@ -2087,76 +2256,27 @@ impl<'a, W: Word> ScatterGatherBuilder<'a, W> {
     ///
     /// A `Transfer` future that completes when the entire chain has executed.
     pub fn build(&mut self, channel: DmaChannel<'a>) -> Result<Transfer<'a>, Error> {
-        if self.count == 0 {
-            return Err(Error::Configuration);
-        }
-
-        // Link TCDs together
-        //
-        // CSR bit definitions:
-        // - START = bit 0 = 0x0001 (triggers transfer when set)
-        // - INTMAJOR = bit 1 = 0x0002 (interrupt on major loop complete)
-        // - ESG = bit 4 = 0x0010 (enable scatter-gather, loads next TCD on complete)
-        //
-        // When hardware loads a TCD via scatter-gather (ESG), it copies the TCD's
-        // CSR directly into the hardware register. If START is not set in that CSR,
-        // the hardware will NOT auto-execute the loaded TCD.
-        //
-        // Strategy:
-        // - First TCD: ESG | INTMAJOR (no START - we add it manually after loading)
-        // - Middle TCDs: ESG | INTMAJOR | START (auto-execute when loaded via S/G)
-        // - Last TCD: INTMAJOR | START (auto-execute, no further linking)
-        for i in 0..self.count {
-            let is_first = i == 0;
-            let is_last = i == self.count - 1;
-
-            if is_first {
-                if is_last {
-                    // Only one TCD - no ESG, no START (we add START manually)
-                    self.tcds[i].dlast_sga = 0;
-                    self.tcds[i].csr = 0x0002; // INTMAJOR only
-                } else {
-                    // First of multiple - ESG to link, no START (we add START manually)
-                    self.tcds[i].dlast_sga = &self.tcds[i + 1] as *const Tcd as i32;
-                    self.tcds[i].csr = 0x0012; // ESG | INTMAJOR
-                }
-            } else if is_last {
-                // Last TCD (not first) - no ESG, but START so it auto-executes
-                self.tcds[i].dlast_sga = 0;
-                self.tcds[i].csr = 0x0003; // INTMAJOR | START
-            } else {
-                // Middle TCD - ESG to link, and START so it auto-executes
-                self.tcds[i].dlast_sga = &self.tcds[i + 1] as *const Tcd as i32;
-                self.tcds[i].csr = 0x0013; // ESG | INTMAJOR | START
-            }
-        }
-
-        let t = channel.tcd();
-
-        // Reset channel state - clear DONE, disable requests, clear errors
-        // This ensures the channel is in a clean state before loading the TCD
-        DmaChannel::reset_channel_state(&t);
-
-        // Memory barrier to ensure channel state is reset before loading TCD
-        cortex_m::asm::dsb();
-
-        // Load first TCD into hardware
-        unsafe {
-            channel.load_tcd(&self.tcds[0]);
-        }
-
-        // Memory barrier before setting START
-        cortex_m::asm::dsb();
-
-        // Start the transfer
-        t.tcd_csr().modify(|w| w.set_start(Start::ChannelStarted));
-
+        self.arm(&channel)?;
         Ok(Transfer::new(channel))
+    }
+
+    /// Like [`Self::build`] but borrows the channel (returns a `Transfer` tied to
+    /// the borrow). Kickoff mode (software `START` vs hardware `ERQ`) is derived
+    /// from the segment types via [`Self::arm`] — e.g. mem-to-mem starts in
+    /// software, while a peripheral chain (I3C target IBI read: body ->
+    /// SWDATAB1, final byte -> SWDATABE) runs request-paced.
+    pub fn build_borrowed<'ch>(&mut self, channel: &'ch mut DmaChannel<'_>) -> Result<Transfer<'ch>, Error>
+    where
+        'a: 'ch,
+    {
+        self.arm(channel)?;
+        Ok(Transfer::new(channel.reborrow()))
     }
 
     /// Reset the builder for reuse.
     pub fn clear(&mut self) {
         self.count = 0;
+        self.peripheral_paced = false;
     }
 }
 
