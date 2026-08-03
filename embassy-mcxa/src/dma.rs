@@ -114,7 +114,7 @@ use core::task::{Context, Poll};
 use embassy_hal_internal::{Peri, PeripheralType};
 use maitake_sync::WaitCell;
 
-pub(crate) use crate::_generated::DmaRequest;
+pub use crate::_generated::DmaRequest;
 use crate::clocks::enable_and_reset;
 use crate::clocks::periph_helpers::NoConfig;
 use crate::dma::sealed::SealedChannel;
@@ -1070,11 +1070,15 @@ impl DmaChannel<'_> {
         Ok(())
     }
 
-    /// Configure the integrated channel MUX to use the given typed
-    /// DMA request source (e.g., [`Lpuart2TxRequest`] or [`Lpuart2RxRequest`]).
+    /// Configure the integrated channel MUX to select which peripheral's
+    /// request line paces this channel.
     ///
-    /// This is the type-safe version that uses marker types to ensure
-    /// compile-time verification of request source validity.
+    /// This must be called before arming a peripheral-paced transfer — including
+    /// a [`ScatterGatherBuilder`] chain containing a
+    /// [`ScatterGatherTransfer::MemToPeripheral`] or
+    /// [`ScatterGatherTransfer::PeripheralToMem`] segment. Without it the mux
+    /// stays at 0, no request reaches the channel, and the transfer never
+    /// advances past its first minor loop.
     ///
     /// # Safety
     ///
@@ -1091,14 +1095,14 @@ impl DmaChannel<'_> {
     /// # Example
     ///
     /// ```rust,ignore
-    /// use embassy_mcxa::dma::{DmaChannel, Lpuart2RxRequest};
+    /// use embassy_mcxa::dma::{DmaChannel, DmaRequest};
     ///
     /// unsafe {
-    ///     channel.set_request_source(Lpuart2RxRequest::REQUEST_NUMBER);
+    ///     channel.set_request_source(DmaRequest::Lpuart2Rx);
     /// }
     /// ```
     #[inline]
-    pub(crate) unsafe fn set_request_source(&self, source: DmaRequest) {
+    pub unsafe fn set_request_source(&self, source: DmaRequest) {
         // Two-step write per NXP SDK: clear to 0, then set actual source.
         self.tcd().ch_mux().write(|w| w.set_src(0));
         cortex_m::asm::dsb(); // Ensure the clear completes before setting new source
@@ -1996,10 +2000,49 @@ impl<'a> DmaChannel<'a> {
 /// Maximum number of TCDs in a scatter-gather chain.
 pub(crate) const MAX_SCATTER_GATHER_TCDS: usize = 16;
 
+/// A scatter-gather transfer segment description.
+pub enum ScatterGatherTransfer<'b, W: Word> {
+    /// Transfer from memory buffer to memory buffer.
+    MemToMem { src: &'b [W], dst: &'b mut [W] },
+    /// Transfer from memory buffer to a fixed peripheral address.
+    MemToPeripheral { src: &'b [W], peri_addr: *mut W },
+    /// Transfer from a fixed peripheral address to memory buffer.
+    PeripheralToMem { peri_addr: *const W, dst: &'b mut [W] },
+}
+
+impl<'b, W: Word> ScatterGatherTransfer<'b, W> {
+    /// Create a memory-to-memory segment.
+    pub fn mem_to_mem(src: &'b [W], dst: &'b mut [W]) -> Self {
+        Self::MemToMem { src, dst }
+    }
+
+    /// Create a memory-to-peripheral segment.
+    pub fn mem_to_peripheral(src: &'b [W], peri_addr: *mut W) -> Self {
+        Self::MemToPeripheral { src, peri_addr }
+    }
+
+    /// Create a peripheral-to-memory segment.
+    pub fn peripheral_to_mem(peri_addr: *const W, dst: &'b mut [W]) -> Self {
+        Self::PeripheralToMem { peri_addr, dst }
+    }
+}
+
 /// A builder for constructing scatter-gather DMA transfer chains.
 ///
 /// This provides a type-safe way to build TCD chains for scatter-gather
 /// transfers without manual TCD manipulation.
+///
+/// Segment execution model:
+/// - Memory-to-memory segments run as a single major loop where `NBYTES`
+///   covers the full segment payload.
+/// - Peripheral-paced segments (`MemToPeripheral`, `PeripheralToMem`) use
+///   one word per minor loop (`NBYTES = size_of::<W>()`) and set
+///   `CITER/BITER` to the segment element count.
+///
+/// Interrupt policy:
+/// - Only the final descriptor in the chain enables major-completion
+///   interrupt (`INTMAJOR`).
+/// - Intermediate descriptors chain via `ESG` and do not interrupt.
 ///
 /// # Example
 ///
@@ -2053,6 +2096,9 @@ pub struct ScatterGatherBuilder<'a, W: Word> {
     /// Phantom marker for word type
     _phantom: core::marker::PhantomData<W>,
 
+    /// True when at least one segment is paced by a peripheral request.
+    peripheral_paced: bool,
+
     _plt: core::marker::PhantomData<&'a mut W>,
 }
 
@@ -2063,8 +2109,91 @@ impl<'a, W: Word> ScatterGatherBuilder<'a, W> {
             tcds: [Tcd::default(); MAX_SCATTER_GATHER_TCDS],
             count: 0,
             _phantom: core::marker::PhantomData,
+            peripheral_paced: false,
             _plt: core::marker::PhantomData,
         }
+    }
+
+    /// Add a transfer segment to the chain.
+    pub fn add_transfer_segment<'b: 'a>(
+        &mut self,
+        segment: ScatterGatherTransfer<'b, W>,
+    ) -> Result<&mut Self, InvalidParameters> {
+        if self.count >= MAX_SCATTER_GATHER_TCDS {
+            return Err(InvalidParameters);
+        }
+
+        let size = W::size();
+        let byte_size = size.bytes();
+        let hw_size = size.to_hw_size();
+
+        let (saddr, daddr, nbytes, major_count, src_fixed, dst_fixed, peripheral_paced) = match segment {
+            ScatterGatherTransfer::MemToMem { src, dst } => {
+                if src.is_empty() || dst.len() < src.len() || src.len() > DMA_MAX_TRANSFER_SIZE {
+                    return Err(InvalidParameters);
+                }
+                // Software-paced memory copy: run this segment in a single major loop.
+                (
+                    src.as_ptr() as u32,
+                    dst.as_mut_ptr() as u32,
+                    (src.len() * byte_size) as u32,
+                    1,
+                    false,
+                    false,
+                    false,
+                )
+            }
+            ScatterGatherTransfer::MemToPeripheral { src, peri_addr } => {
+                if src.is_empty() || src.len() > DMA_MAX_TRANSFER_SIZE {
+                    return Err(InvalidParameters);
+                }
+                // Peripheral-paced TX: one word per minor loop, element count in major loop.
+                let major_count = u16::try_from(src.len()).map_err(|_| InvalidParameters)?;
+                (
+                    src.as_ptr() as u32,
+                    peri_addr as u32,
+                    byte_size as u32,
+                    major_count,
+                    false,
+                    true,
+                    true,
+                )
+            }
+            ScatterGatherTransfer::PeripheralToMem { peri_addr, dst } => {
+                if dst.is_empty() || dst.len() > DMA_MAX_TRANSFER_SIZE {
+                    return Err(InvalidParameters);
+                }
+                // Peripheral-paced RX: one word per minor loop, element count in major loop.
+                let major_count = u16::try_from(dst.len()).map_err(|_| InvalidParameters)?;
+                (
+                    peri_addr as u32,
+                    dst.as_mut_ptr() as u32,
+                    byte_size as u32,
+                    major_count,
+                    true,
+                    false,
+                    true,
+                )
+            }
+        };
+
+        self.tcds[self.count] = Tcd {
+            saddr,
+            soff: if src_fixed { 0 } else { byte_size as i16 },
+            attr: ((hw_size as u16) << 8) | (hw_size as u16),
+            nbytes,
+            slast: 0,
+            daddr,
+            doff: if dst_fixed { 0 } else { byte_size as i16 },
+            citer: major_count,
+            dlast_sga: 0,
+            csr: 0,
+            biter: major_count,
+        };
+
+        self.count += 1;
+        self.peripheral_paced |= peripheral_paced;
+        Ok(self)
     }
 
     /// Add a memory-to-memory transfer segment to the chain.
@@ -2078,32 +2207,83 @@ impl<'a, W: Word> ScatterGatherBuilder<'a, W> {
     ///
     /// Panics if the maximum number of segments (16) is exceeded.
     pub fn add_transfer<'b: 'a>(&mut self, src: &'b [W], dst: &'b mut [W]) -> &mut Self {
-        assert!(self.count < MAX_SCATTER_GATHER_TCDS, "Too many scatter-gather segments");
-        assert!(!src.is_empty());
-        assert!(dst.len() >= src.len());
-
-        let size = W::size();
-        let byte_size = size.bytes();
-        let hw_size = size.to_hw_size();
-        let nbytes = (src.len() * byte_size) as u32;
-
-        // Build the TCD for this segment
-        self.tcds[self.count] = Tcd {
-            saddr: src.as_ptr() as u32,
-            soff: byte_size as i16,
-            attr: ((hw_size as u16) << 8) | (hw_size as u16), // SSIZE | DSIZE
-            nbytes,
-            slast: 0,
-            daddr: dst.as_mut_ptr() as u32,
-            doff: byte_size as i16,
-            citer: 1,
-            dlast_sga: 0, // Will be filled in by build()
-            csr: 0x0002,  // INTMAJOR only (ESG will be set for non-last TCDs)
-            biter: 1,
-        };
-
-        self.count += 1;
+        self.add_transfer_segment(ScatterGatherTransfer::MemToMem { src, dst })
+            .expect("Too many scatter-gather segments or invalid segment");
         self
+    }
+
+    fn arm(&mut self, channel: &DmaChannel<'_>) -> Result<(), Error> {
+        if self.count == 0 {
+            return Err(Error::Configuration);
+        }
+
+        // Link TCDs together.
+        //
+        // CSR bit definitions used by this driver:
+        // - START = bit 0 = 0x0001
+        // - INTMAJOR = bit 1 = 0x0002
+        // - DREQ = bit 3 = 0x0008
+        // - ESG = bit 4 = 0x0010
+        //
+        // Strategy:
+        // - Linked TCDs (first/middle): ESG with DREQ cleared.
+        // - Final TCD: DREQ (auto-disable requests when chain completes).
+        // - START is not encoded in these prebuilt CSR values. The first
+        //   descriptor is kicked below via ERQ enable (peripheral-paced) or
+        //   explicit START write (software-paced). Later descriptors execute
+        //   through ESG chaining.
+        //
+        // This matches the current final-only completion interrupt policy.
+        const CSR_DREQ: u16 = 1 << 3;
+        const CSR_INTMAJOR: u16 = 1 << 1;
+        const CSR_ESG: u16 = 1 << 4;
+
+        for i in 0..self.count {
+            let is_last = i == self.count - 1;
+
+            if !is_last {
+                self.tcds[i].dlast_sga = &self.tcds[i + 1] as *const Tcd as i32;
+            } else {
+                self.tcds[i].dlast_sga = 0;
+            }
+
+            let mut csr = 0;
+            if !is_last {
+                csr |= CSR_ESG;
+            }
+            if is_last {
+                csr |= CSR_DREQ;
+                csr |= CSR_INTMAJOR;
+            }
+            self.tcds[i].csr = csr;
+        }
+
+        let t = channel.tcd();
+
+        // Reset channel state - clear DONE, disable requests, clear errors
+        // This ensures the channel is in a clean state before loading the TCD
+        DmaChannel::reset_channel_state(&t);
+        // Memory barrier to ensure channel state is reset before loading TCD
+        cortex_m::asm::dsb();
+
+        // Load first TCD into hardware
+        unsafe {
+            channel.load_tcd(&self.tcds[0]);
+        }
+
+        // Memory barrier before setting START or enabling request
+        cortex_m::asm::dsb();
+
+        // Start the transfer. If peripheral-paced, enable request; otherwise, start the channel.
+        if self.peripheral_paced {
+            unsafe {
+                channel.enable_request();
+            }
+        } else {
+            t.tcd_csr().modify(|w| w.set_start(Start::ChannelStarted));
+        }
+
+        Ok(())
     }
 
     /// Get the number of transfer segments added.
@@ -2121,76 +2301,20 @@ impl<'a, W: Word> ScatterGatherBuilder<'a, W> {
     ///
     /// A `Transfer` future that completes when the entire chain has executed.
     pub fn build(&mut self, channel: DmaChannel<'a>) -> Result<Transfer<'a>, Error> {
-        if self.count == 0 {
-            return Err(Error::Configuration);
-        }
-
-        // Link TCDs together
-        //
-        // CSR bit definitions:
-        // - START = bit 0 = 0x0001 (triggers transfer when set)
-        // - INTMAJOR = bit 1 = 0x0002 (interrupt on major loop complete)
-        // - ESG = bit 4 = 0x0010 (enable scatter-gather, loads next TCD on complete)
-        //
-        // When hardware loads a TCD via scatter-gather (ESG), it copies the TCD's
-        // CSR directly into the hardware register. If START is not set in that CSR,
-        // the hardware will NOT auto-execute the loaded TCD.
-        //
-        // Strategy:
-        // - First TCD: ESG | INTMAJOR (no START - we add it manually after loading)
-        // - Middle TCDs: ESG | INTMAJOR | START (auto-execute when loaded via S/G)
-        // - Last TCD: INTMAJOR | START (auto-execute, no further linking)
-        for i in 0..self.count {
-            let is_first = i == 0;
-            let is_last = i == self.count - 1;
-
-            if is_first {
-                if is_last {
-                    // Only one TCD - no ESG, no START (we add START manually)
-                    self.tcds[i].dlast_sga = 0;
-                    self.tcds[i].csr = 0x0002; // INTMAJOR only
-                } else {
-                    // First of multiple - ESG to link, no START (we add START manually)
-                    self.tcds[i].dlast_sga = &self.tcds[i + 1] as *const Tcd as i32;
-                    self.tcds[i].csr = 0x0012; // ESG | INTMAJOR
-                }
-            } else if is_last {
-                // Last TCD (not first) - no ESG, but START so it auto-executes
-                self.tcds[i].dlast_sga = 0;
-                self.tcds[i].csr = 0x0003; // INTMAJOR | START
-            } else {
-                // Middle TCD - ESG to link, and START so it auto-executes
-                self.tcds[i].dlast_sga = &self.tcds[i + 1] as *const Tcd as i32;
-                self.tcds[i].csr = 0x0013; // ESG | INTMAJOR | START
-            }
-        }
-
-        let t = channel.tcd();
-
-        // Reset channel state - clear DONE, disable requests, clear errors
-        // This ensures the channel is in a clean state before loading the TCD
-        DmaChannel::reset_channel_state(&t);
-
-        // Memory barrier to ensure channel state is reset before loading TCD
-        cortex_m::asm::dsb();
-
-        // Load first TCD into hardware
-        unsafe {
-            channel.load_tcd(&self.tcds[0]);
-        }
-
-        // Memory barrier before setting START
-        cortex_m::asm::dsb();
-
-        // Start the transfer
-        t.tcd_csr().modify(|w| w.set_start(Start::ChannelStarted));
-
+        self.arm(&channel)?;
         Ok(Transfer::new(channel))
+    }
+
+    /// Build the scatter-gather chain with a borrowed channel.
+    pub fn build_borrowed<'ch>(&mut self, channel: &'ch mut DmaChannel<'_>) -> Result<Transfer<'ch>, Error> {
+        self.arm(channel)?;
+        Ok(Transfer::new(channel.reborrow()))
     }
 
     /// Reset the builder for reuse.
     pub fn clear(&mut self) {
         self.count = 0;
+        self.peripheral_paced = false;
     }
 }
 
@@ -2217,9 +2341,17 @@ pub struct ScatterGatherResult {
 /// Call this from your interrupt handler to clear the interrupt flag and wake the waker.
 /// This handles both half-transfer and complete-transfer interrupts.
 ///
+/// Returns `true` only when this interrupt represents an actual major-loop
+/// completion (`CH_CSR.DONE` still set when we get here). Callers must use this
+/// to gate any completion callback: the channel IRQ can also be entered for a
+/// half-transfer, for an error, or - critically - as a *stale* NVIC-latched
+/// pending IRQ whose `CH_INT`/`DONE` flags were already consumed by another ISR
+/// that tore the transfer down and re-armed the channel in the meantime.
+/// Treating those as completions retires a transfer that is still in flight.
+///
 /// # Safety
 /// Must be called from the correct DMA channel interrupt context.
-pub(crate) unsafe fn on_interrupt(dma: usize, channel: usize) {
+pub(crate) unsafe fn on_interrupt(dma: usize, channel: usize) -> bool {
     crate::perf_counters::incr_interrupt_edma0();
 
     let t = match dma {
@@ -2231,6 +2363,24 @@ pub(crate) unsafe fn on_interrupt(dma: usize, channel: usize) {
 
     // Read TCD CSR to determine interrupt source
     let csr = t.tcd_csr().read();
+    let ch_csr_before = t.ch_csr().read();
+    let ch_int_before = t.ch_int().read();
+    let ch_es = t.ch_es().read();
+
+    #[cfg(feature = "defmt")]
+    defmt::trace!(
+        "[dma][irq] ch={} tcd_csr=0x{:04x} ch_csr=0x{:08x} ch_int=0x{:08x} ch_es=0x{:08x}",
+        channel,
+        csr.0,
+        ch_csr_before.0,
+        ch_int_before.0,
+        ch_es.0
+    );
+
+    if ch_es.err() {
+        #[cfg(feature = "defmt")]
+        defmt::trace!("[dma][irq] ch={} error detected: ch_es=0x{:08x}", channel, ch_es.0);
+    }
 
     // Check if this is a half-transfer interrupt
     // INTHALF is set and we're at or past the half-way point
@@ -2240,6 +2390,15 @@ pub(crate) unsafe fn on_interrupt(dma: usize, channel: usize) {
         let half_point = biter / 2;
 
         if citer <= half_point && citer > 0 {
+            #[cfg(feature = "defmt")]
+            defmt::trace!(
+                "[dma][irq] ch={} half-transfer wake: biter={} citer={} half_point={}",
+                channel,
+                biter,
+                citer,
+                half_point
+            );
+
             // Half-transfer interrupt - wake half_waker
             crate::perf_counters::incr_interrupt_edma0_wake();
             half_waker(dma, channel).wake();
@@ -2251,10 +2410,21 @@ pub(crate) unsafe fn on_interrupt(dma: usize, channel: usize) {
 
     // If DONE is set, this is a complete-transfer interrupt
     // Only wake the full-transfer waker when the transfer is actually complete
-    if t.ch_csr().read().done() {
+    let ch_csr_after = t.ch_csr().read();
+    if ch_csr_after.done() {
+        #[cfg(feature = "defmt")]
+        defmt::trace!(
+            "[dma][irq] ch={} complete wake: ch_csr=0x{:08x}",
+            channel,
+            ch_csr_after.0
+        );
+
         crate::perf_counters::incr_interrupt_edma0_wake();
         waker(dma, channel).wake();
+        return true;
     }
+
+    false
 }
 
 #[doc(hidden)]
@@ -2267,13 +2437,22 @@ macro_rules! impl_dma_interrupt_handler {
             // SAFETY: The correct $ch is called as generated, We check that
             // the given callback is non-null before calling.
             unsafe {
-                crate::dma::on_interrupt($dma, $ch);
-
-                // See https://doc.rust-lang.org/std/primitive.fn.html#casting-to-and-from-integers
-                let cb: *mut () = crate::dma::CALLBACKS[$dma][$ch].load(core::sync::atomic::Ordering::Acquire);
-                if !cb.is_null() {
-                    let cb: fn() = core::mem::transmute(cb);
-                    (cb)();
+                // Only run the completion callback for a genuine major-loop
+                // completion. The channel IRQ is also entered for
+                // half-transfer/error events, and can be entered with a stale
+                // NVIC-latched pending bit after another ISR already consumed
+                // this completion and re-armed the channel. Invoking the
+                // callback in those cases retires a transfer that is still in
+                // flight - for the I3C target BBQ that commits a partial RX
+                // frame mid-transaction and tears the RX DMA down while bytes
+                // are still streaming, which then latches SERRWARN.ORUN.
+                if crate::dma::on_interrupt($dma, $ch) {
+                    // See https://doc.rust-lang.org/std/primitive.fn.html#casting-to-and-from-integers
+                    let cb: *mut () = crate::dma::CALLBACKS[$dma][$ch].load(core::sync::atomic::Ordering::Acquire);
+                    if !cb.is_null() {
+                        let cb: fn() = core::mem::transmute(cb);
+                        (cb)();
+                    }
                 }
             }
         }

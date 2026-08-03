@@ -18,7 +18,24 @@ use crate::pac::i3c::{
     Disto, Hkeep, Ibiresp, Ibitype, MctrlDir as I3cDir, MdatactrlRxtrig, MdatactrlTxtrig, Mstena, Request, State, Type,
 };
 
-const MAX_CHUNK_SIZE: usize = 256;
+// RDTERM is an 8-bit field. Programming 0 means 256 bytes, not 0 bytes.
+//
+// This matters for chunked reads because issuing multiple STARTs with
+// RDTERM=0 can look like open-ended reads to the target, and some targets
+// report TERM/NACK on chunk boundaries even when bytes were already delivered.
+// Keeping chunk size at 255 avoids wraparound and allows explicit RDTERM for
+// bounded transactions.
+const MAX_CHUNK_SIZE: usize = 255;
+
+// After `MSTATUS[IBIWON]` is raised for a Hot-Join or controller request, the
+// peripheral moves into `STATE = IBIACK` ("wait for an IBI ACK/NACK decision",
+// RM 53.7.31) and stalls the bus until software emits the response. Both events
+// come from the same bus edge, so by the time the interrupt has woken us the
+// state has long settled; this budget only guards the theoretical case where we
+// observe the flag mid-transition. It is deliberately generous because the
+// alternative — writing `IBIACKNACK` from a non-hold state — is itself an
+// invalid request (RM 53.7.36 `MERRWARN[INVREQ]`).
+const IBIACK_SETTLE_POLLS: u32 = 1000;
 
 /// Setup Errors
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -70,6 +87,12 @@ pub enum IOError {
     Other,
     /// Requested IBI slot already holds a different address.
     IbiSlotOccupied,
+    /// More slaves arbitrated during DAA than the caller-provided buffer could hold.
+    ///
+    /// A STOP has been emitted on the bus before this error is returned;
+    /// devices assigned up to the overflow are populated in the caller's slice.
+    /// Mirrors the NXP SDK's `kStatus_I3C_SlaveCountExceed`.
+    SlaveCountExceeded,
 }
 
 impl From<crate::dma::InvalidParameters> for IOError {
@@ -170,6 +193,23 @@ impl From<Payload> for crate::pac::i3c::Nobyte {
             Payload::No => Self::NoIbibyte,
         }
     }
+}
+
+/// Decoded result of [`I3c::async_wait_for_ibi`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum IbiEvent {
+    /// A regular IBI was accepted.
+    Ibi {
+        /// IBI source dynamic address from `MSTATUS.IBIADDR`.
+        address: u8,
+        /// Number of payload bytes drained into the caller buffer.
+        payload_len: usize,
+    },
+    /// A Hot-Join request was accepted.
+    HotJoin,
+    /// A Controller Request was accepted.
+    ControllerRequest,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -341,6 +381,7 @@ impl<'d, M: Mode> I3c<'d, M> {
 
     fn set_configuration(&self, config: &Config) -> Result<(), SetupError> {
         self.clear_flags();
+        self.clear_slvstart();
 
         self.info.regs().mdatactrl().modify(|w| {
             w.set_flushtb(true);
@@ -368,6 +409,23 @@ impl<'d, M: Mode> I3c<'d, M> {
             w.set_hkeep(Hkeep::None);
             w.set_odstop(false);
             w.set_odhpp(odhpp_enabled);
+        });
+
+        // Arm SLVSTART permanently.
+        //
+        // A target asserting SDA low (IBI, controller request, or Hot-Join) can
+        // happen at any moment, not just while the application happens to be
+        // sitting in `async_wait_for_ibi()`. The NXP SDK arms this once in
+        // `I3C_MasterTransferCreateHandle` (`kMasterIrqFlags` includes
+        // `kI3C_MasterSlaveStartFlag`) and leaves it armed for the lifetime of
+        // the handle; do the same so the request always raises an interrupt.
+        //
+        // The interrupt handler disables the enable to deassert the level-held
+        // IRQ line and each `wait_for` predicate re-arms what it needs, but
+        // `MINTCLR` only clears interrupt *enables* — the sticky `MSTATUS`
+        // flags survive (RM 53.7.34) — so the event itself is never lost here.
+        self.info.regs().mintset().write(|w| {
+            w.set_slvstart(true);
         });
 
         Ok(())
@@ -500,14 +558,30 @@ impl<'d, M: Mode> I3c<'d, M> {
         let _ = self.blocking_stop(bus_type);
     }
 
+    /// Clear the transfer-related sticky status flags.
+    ///
+    /// `MSTATUS.SLVSTART` is deliberately **not** cleared here. It latches a
+    /// target's bus request (IBI / controller request / Hot-Join), which is
+    /// asynchronous to whatever transfer the application is running. Since this
+    /// is called at the top of every `blocking_start()` / `async_start()`, doing
+    /// a blanket W1C would silently destroy a Hot-Join that arrived mid-loop and
+    /// leave a later `async_wait_for_ibi()` waiting forever. Use
+    /// [`Self::clear_slvstart`] once the request has actually been consumed.
     fn clear_flags(&self) {
         self.info.regs().mstatus().write(|w| {
-            w.set_slvstart(true);
             w.set_mctrldone(true);
             w.set_complete(true);
             w.set_ibiwon(true);
             w.set_nowmaster(true);
         });
+    }
+
+    /// Clear the latched `MSTATUS.SLVSTART` target-request flag (W1C).
+    ///
+    /// Only call this after the request has been serviced, or during bring-up to
+    /// discard a stale latch.
+    fn clear_slvstart(&self) {
+        self.info.regs().mstatus().write(|w| w.set_slvstart(true));
     }
 
     fn clear_errors(&self) {
@@ -1084,6 +1158,9 @@ impl<'d> AsyncEngine for I3c<'d, Dma<'d>> {
             return Err(IOError::InvalidReadBufferLength);
         }
 
+        #[cfg(feature = "defmt")]
+        defmt::trace!("[i3c-ctrl dma-read] start addr=0x{:02x} len={}", address, read.len());
+
         // perform corrective action if the future is dropped
         let on_drop = OnDrop::new(|| {
             self.blocking_remediation(bus_type);
@@ -1098,14 +1175,18 @@ impl<'d> AsyncEngine for I3c<'d, Dma<'d>> {
         // path at the bottom can run regardless of error.
         let mut result: Result<usize, IOError> = Ok(0);
 
-        'outer: for chunk in read.chunks_mut(MAX_CHUNK_SIZE) {
-            // `chunk.len() as u8` gives RDTERM=N for 1..=255 and RDTERM=0
-            // for exactly 256 (matches SDK: "no controller-side termination;
-            // slave drives end via T-bit").
-            if let Err(e) = self.async_start(address, bus_type, Dir::Read, chunk.len() as u8).await {
-                result = Err(e);
+        let rdterm = if read.len() <= 255 { read.len() as u8 } else { 0 };
+        if let Err(e) = self.async_start(address, bus_type, Dir::Read, rdterm).await {
+            result = Err(e);
+        }
+
+        'outer: for chunk in read.chunks_mut(DMA_MAX_TRANSFER_SIZE) {
+            if result.is_err() {
                 break 'outer;
             }
+
+            #[cfg(feature = "defmt")]
+            defmt::trace!("[i3c-ctrl dma-read] arm chunk len={}", chunk.len());
 
             let peri_addr = self.info.regs().mrdatab().as_ptr() as *const u8;
 
@@ -1166,8 +1247,12 @@ impl<'d> AsyncEngine for I3c<'d, Dma<'d>> {
             // Ensure DMA writes are visible to CPU
             cortex_m::asm::dsb();
 
-            // How many bytes did DMA actually move into this chunk?
-            let chunk_done = self.mode.rx_dma.transferred_bytes().min(chunk.len());
+            let dma_done = self.mode.rx_dma.is_done();
+            let chunk_done = if dma_done {
+                chunk.len()
+            } else {
+                self.mode.rx_dma.transferred_bytes().min(chunk.len())
+            };
 
             // Cleanup
             self.info
@@ -1182,6 +1267,15 @@ impl<'d> AsyncEngine for I3c<'d, Dma<'d>> {
             let st_after = self.info.regs().mstatus().read();
             bytes_received += chunk_done;
 
+            #[cfg(feature = "defmt")]
+            defmt::trace!(
+                "[i3c-ctrl dma-read] chunk_done={} dma_done={} complete={} errwarn={}",
+                chunk_done,
+                dma_done,
+                st_after.complete(),
+                st_after.errwarn()
+            );
+
             // Classify the outcome. Per spec, target-terminated SDR reads
             // can end before RDTERM with no error — and that's what SDK
             // sees (status=0). The MCXA IP may still latch MERRWARN bits
@@ -1194,7 +1288,7 @@ impl<'d> AsyncEngine for I3c<'d, Dma<'d>> {
             //     (true address NACK, parity, etc.); propagate.
             //   - errwarn at chunk boundary with full chunk: same rule
             //     (we got the bytes we asked for, suppress).
-            if chunk_done < chunk.len() {
+            if !dma_done || st_after.complete() || st_after.errwarn() {
                 if st_after.errwarn() {
                     if bytes_received > 0 {
                         self.clear_errors();
@@ -1207,11 +1301,6 @@ impl<'d> AsyncEngine for I3c<'d, Dma<'d>> {
                 }
                 break 'outer;
             } else {
-                if st_after.errwarn() {
-                    // Full chunk delivered + errwarn. Suppress as long as
-                    // we did get data.
-                    self.clear_errors();
-                }
                 result = Ok(bytes_received);
             }
         }
@@ -1400,6 +1489,25 @@ where
             .map_err(|_| IOError::Overwrite)
     }
 
+    /// Wait for one of MCTRLDONE, COMPLETE, or ERRWARN — used inside
+    /// [`Self::async_daa`] to distinguish "next slave arbitrated" from
+    /// "end of DAA sequence" from "bus error".
+    async fn async_wait_daa_event(&self) -> Result<(), IOError> {
+        self.info
+            .wait_cell()
+            .wait_for(|| {
+                self.info.regs().mintset().write(|w| {
+                    w.set_mctrldone(true);
+                    w.set_complete(true);
+                    w.set_errwarn(true);
+                });
+                let s = self.info.regs().mstatus().read();
+                s.mctrldone() || s.complete() || s.errwarn()
+            })
+            .await
+            .map_err(|_| IOError::Other)
+    }
+
     async fn async_wait_for_rx_fifo(&self) -> Result<RxFifoStatus, IOError> {
         self.info
             .wait_cell()
@@ -1454,6 +1562,47 @@ where
             w.set_request(Request::Emitstartaddr);
             w.set_dir(dir.into());
             w.set_ibiresp(Ibiresp::Ack);
+        });
+
+        self.async_wait_for_ctrldone().await?;
+        self.status()
+    }
+
+    /// Emit an explicit IBI ACK/NACK response while the peripheral is parked in
+    /// the `IBIACK` manual-hold state.
+    ///
+    /// Required for Hot-Join and controller-request arbitration, which the
+    /// hardware never auto-answers (RM 53.7.31 `MSTATUS[IBIWON]`). Equivalent to
+    /// the SDK's `I3C_MasterEmitIBIResponse()`.
+    ///
+    /// No-op when the peripheral is not in the manual hold — issuing
+    /// `IBIACKNACK` from a normal state is itself an invalid request
+    /// (RM 53.7.36 `MERRWARN[INVREQ]`, "IBI ACK NACK in normal states").
+    async fn async_emit_ibi_response(&self, response: Ibiresp) -> Result<(), IOError> {
+        // Spin only while the state machine is still transitioning. Any state
+        // other than IBIACK that is a settled state (the bus stopped, a message
+        // is active, or the IBI payload is already streaming) means there is no
+        // manual hold to answer, so bail out immediately rather than burning the
+        // whole budget.
+        let mut settle = 0u32;
+        loop {
+            let status = self.info.regs().mstatus().read();
+            match status.state() {
+                State::Ibiack => break,
+                State::Idle | State::Normact | State::Ibircv => return Ok(()),
+                _ if status.errwarn() => return self.status(),
+                _ => {
+                    settle += 1;
+                    if settle >= IBIACK_SETTLE_POLLS {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
+        self.info.regs().mctrl().write(|w| {
+            w.set_request(Request::Ibiacknack);
+            w.set_ibiresp(response);
         });
 
         self.async_wait_for_ctrldone().await?;
@@ -1539,11 +1688,202 @@ where
         Ok(())
     }
 
+    /// Async DAA sequence — mirrors NXP SDK's `I3C_MasterProcessDAASpecifiedBaudrate`.
+    ///
+    /// Emits `ENTDAA` and enumerates every target that arbitrates in, assigning
+    /// dynamic addresses starting from `starting_address` (incrementing by one
+    /// per device). Returns the number of devices actually enumerated on success
+    /// — this may be less than `devices.len()` if no more targets arbitrate
+    /// before hardware latches `MSTATUS.COMPLETE`.
+    ///
+    /// # Comparison with [`Self::daa`]
+    /// The blocking [`Self::daa`] hot-polls `MSTATUS` and requires the caller to
+    /// pre-size `devices` to the exact expected slave count. This method waits
+    /// asynchronously on `MCTRLDONE`/`COMPLETE`/`ERRWARN` interrupts, terminates
+    /// cleanly on `COMPLETE`, and reports a variable count. If more slaves
+    /// arbitrate than `devices` can hold, it emits `STOP` and returns
+    /// [`IOError::SlaveCountExceeded`] — matching the C SDK.
+    ///
+    /// # Errors
+    /// - [`IOError::AddressOutOfRange`] if `starting_address` is 0, `>= 0x7e`,
+    ///   or the `starting_address..starting_address+devices.len()` window
+    ///   crosses `0x7e`.
+    /// - [`IOError::InvalidWriteBufferLength`] if `devices.is_empty()`.
+    /// - [`IOError::Other`] if the bus is not idle on entry.
+    /// - [`IOError::SlaveCountExceeded`] on caller-buffer overflow (STOP emitted).
+    /// - Any [`IOError`] variant surfaced from `MERRWARN` (bus-level failure).
+    ///
+    /// # Bus state on return
+    /// On `Ok` the peripheral has latched `COMPLETE` and returned to `Idle`.
+    /// On `SlaveCountExceeded` a `STOP` has been emitted and the bus is idle.
+    /// On other errors the bus state is undefined — caller must remediate.
+    pub async fn async_daa(&mut self, devices: &mut [DeviceInfo], starting_address: u8) -> Result<usize, IOError> {
+        if devices.is_empty() {
+            return Err(IOError::InvalidWriteBufferLength);
+        }
+
+        let mut address = starting_address;
+        if address == 0 || address >= 0x7e || (address as usize) + devices.len() > 0x7e {
+            return Err(IOError::AddressOutOfRange(address));
+        }
+
+        if self.info.regs().mstatus().read().state() != State::Idle {
+            return Err(IOError::Other);
+        }
+
+        self.clear_errors();
+        self.clear_flags();
+
+        // Emit initial ENTDAA. Peripheral will either arbitrate in the next
+        // target (raising MCTRLDONE with PID data in the RX FIFO) or latch
+        // COMPLETE if no target responds.
+        self.info.regs().mctrl().write(|w| {
+            w.set_request(Request::Processdaa);
+        });
+
+        let mut count = 0usize;
+        loop {
+            self.async_wait_daa_event().await?;
+
+            let s = self.info.regs().mstatus().read();
+            if s.errwarn() {
+                let err = self.status().err().unwrap_or(IOError::Other);
+                return Err(err);
+            }
+            if s.complete() {
+                // Normal end-of-sequence: no more targets on the bus.
+                self.clear_flags();
+                self.clear_errors();
+                return Ok(count);
+            }
+            // MCTRLDONE with a target waiting to be addressed.
+            // Clear it so the next iteration's wait doesn't see a stale edge.
+            self.info.regs().mstatus().write(|w| w.set_mctrldone(true));
+
+            if count >= devices.len() {
+                // Caller's buffer is full but another target arbitrated in.
+                // Emit STOP to cleanly abort the DAA sequence, drain any
+                // residual RX bytes, and surface the overflow.
+                self.info.regs().mctrl().write(|w| {
+                    w.set_request(Request::Emitstop);
+                    w.set_type_(BusType::I3cSdr.into());
+                });
+                // Best-effort drain — ignore anything the target already pushed.
+                while !self.info.regs().mdatactrl().read().rxempty() {
+                    let _ = self.info.regs().mrdatab().read().value();
+                }
+                self.clear_flags();
+                self.clear_errors();
+                return Err(IOError::SlaveCountExceeded);
+            }
+
+            // Drain 8 bytes of PID + BCR + DCR from the RX FIFO.
+            let mut buf = [0u8; 8];
+            for b in buf.iter_mut() {
+                match self.async_wait_for_rx_fifo().await? {
+                    RxFifoStatus::RxPending => {
+                        *b = self.info.regs().mrdatab().read().value();
+                    }
+                    RxFifoStatus::Complete => {
+                        // Peripheral ended the sequence mid-PID. Treat as bus error.
+                        return Err(IOError::Other);
+                    }
+                }
+            }
+
+            // Decode. VID mask 0xFFFE strips the PID parity bit before the
+            // right-shift — matches C SDK exactly (numerically equivalent to
+            // just `>> 1`, but kept for symmetry).
+            let vid = ((((buf[0] as u16) << 8) | (buf[1] as u16)) & 0xFFFE) >> 1;
+            let partno = ((buf[2] as u32) << 24) | ((buf[3] as u32) << 16) | ((buf[4] as u32) << 8) | (buf[5] as u32);
+            let device = &mut devices[count];
+            device.vid = vid;
+            device.partno = partno;
+            device.bcr = buf[6];
+            device.dcr = buf[7];
+            device.addr = address;
+
+            // Write the assigned dynamic address and re-emit ENTDAA. The
+            // peripheral either arbitrates the next target (MCTRLDONE) or
+            // latches COMPLETE if no more targets remain.
+            self.info.regs().mwdatab().write(|w| w.set_value(address));
+            self.info.regs().mctrl().write(|w| w.set_request(Request::Processdaa));
+
+            address += 1;
+            count += 1;
+        }
+    }
+
+    /// Wait for a target IBI and reject it with a NACK.
+    ///
+    /// This is what the Windows I3C stack actually does when a client stops
+    /// listening: `Target::EnableIbiAutoRejectionSync()` sets `IbiReject` in
+    /// the host controller's DAT entry, which auto-NACKs in hardware. No DISEC
+    /// is ever placed on the bus, so a target only learns it has been dropped
+    /// by observing that every retry is rejected.
+    ///
+    /// Provided so that target-side abandon logic can be exercised on hardware.
+    pub async fn async_reject_ibi(&mut self) -> Result<(), IOError> {
+        self.info
+            .wait_cell()
+            .wait_for(|| {
+                self.info.regs().mintset().write(|w| {
+                    w.set_slvstart(true);
+                    w.set_errwarn(true);
+                });
+                let status = self.info.regs().mstatus().read();
+                status.slvstart() || status.errwarn()
+            })
+            .await
+            .map_err(|_| IOError::Other)?;
+
+        self.status()?;
+        self.clear_slvstart();
+
+        self.info.regs().mstatus().write(|w| w.set_ibiwon(true));
+
+        self.info.regs().mctrl().write(|w| {
+            w.set_request(Request::Autoibi);
+            w.set_ibiresp(Ibiresp::Nack);
+        });
+
+        // Wait for the arbitration to be reported so the caller cannot race a
+        // following request against the rejection still being on the wire.
+        self.info
+            .wait_cell()
+            .wait_for(|| {
+                self.info.regs().mintset().write(|w| {
+                    w.set_ibiwon(true);
+                    w.set_complete(true);
+                    w.set_errwarn(true);
+                });
+                let status = self.info.regs().mstatus().read();
+                status.ibiwon() || status.complete() || status.errwarn()
+            })
+            .await
+            .map_err(|_| IOError::Other)?;
+
+        // Rejecting is the point here, so a latched NACK in `MERRWARN` is the
+        // expected outcome rather than a failure. Clear and discard it.
+        let _ = self.status();
+
+        self.info.regs().mstatus().write(|w| {
+            w.set_ibiwon(true);
+            w.set_complete(true);
+        });
+
+        Ok(())
+    }
+
     /// Wait for a target IBI, ACK it, and drain any payload bytes.
     ///
-    /// Returns the IBI target address and the number of payload bytes written into `buf`.
-    /// The P3T1755 (and most sensors) set BCR\[2\]=0 so no payload bytes follow the address header;
-    /// in that case this returns `(addr, 0)`.
+    /// Returns an [`IbiEvent`] based on `MSTATUS.IBITYPE`.
+    ///
+    /// - [`IbiEvent::Ibi`] includes the source address and drained payload length.
+    /// - [`IbiEvent::HotJoin`] indicates a Hot-Join with no payload reporting.
+    ///
+    /// The P3T1755 (and most sensors) set BCR\[2\]=0 so no payload bytes follow the
+    /// address header; in that case this returns `Ibi { payload_len: 0, .. }`.
     ///
     /// **Bus state on return:** the controller has emitted a Stop, so the
     /// bus is idle. This matches the NXP SDK master driver behavior on
@@ -1551,7 +1891,7 @@ where
     /// `fsl_i3c.c`) and is what spec-compliant targets expect before the
     /// next directed transfer. The caller should follow up with
     /// [`Self::async_read`] or [`Self::async_write`] as needed.
-    pub async fn async_wait_for_ibi(&mut self, buf: &mut [u8]) -> Result<(u8, usize), IOError> {
+    pub async fn async_wait_for_ibi(&mut self, buf: &mut [u8]) -> Result<IbiEvent, IOError> {
         // Step 1: Wait for SLVSTART (a target is asserting SDA low to request the bus).
         //
         // NOTE: we deliberately do *not* gate on `mstatus.state() == Slvreq`
@@ -1577,91 +1917,152 @@ where
 
         self.status()?;
 
+        // Consume the latch now, not after the IBI completes: a second target
+        // asserting SDA while we service this one must remain visible to the
+        // next `async_wait_for_ibi()` call.
+        self.clear_slvstart();
+
         // Step 2: Pre-clear IBIWON in case it was already set, so AUTO_IBI doesn't return early.
         self.info.regs().mstatus().write(|w| w.set_ibiwon(true));
 
+        // Everything from AUTO_IBI onwards drives the bus, so from here the
+        // future is no longer cancel-safe on its own: dropping it (e.g. an
+        // `with_timeout` that expires while an IBI is in flight) would leave
+        // the peripheral parked mid-transaction — typically in the manual
+        // `IBIACK` hold described in step 4b — still owning the bus. Every
+        // later request then fails `MERRWARN[INVREQ]`, and because the
+        // application's next transfer blocks on a state machine that never
+        // advances, the whole bus wedges with no timeout to recover it.
+        //
+        // Remediate exactly like `async_write_internal` does: flush the FIFOs
+        // and emit a STOP. The reborrow keeps `self` shareable with the guard;
+        // nothing below needs it mutably.
+        let this: &Self = self;
+        let on_drop = OnDrop::new(|| {
+            this.blocking_remediation(BusType::I3cSdr);
+        });
+
         // Step 3: Issue AUTO_IBI with ACK — hardware handles the IBI protocol handshake.
-        self.info.regs().mctrl().write(|w| {
+        this.info.regs().mctrl().write(|w| {
             w.set_request(Request::Autoibi);
             w.set_ibiresp(Ibiresp::Ack);
         });
 
         // Step 4: Wait for IBIWON — the IBI has been accepted and the address header received.
-        self.info
+        this.info
             .wait_cell()
             .wait_for(|| {
-                self.info.regs().mintset().write(|w| {
+                this.info.regs().mintset().write(|w| {
                     w.set_ibiwon(true);
                     w.set_errwarn(true);
                 });
-                let status = self.info.regs().mstatus().read();
+                let status = this.info.regs().mstatus().read();
                 status.ibiwon() || status.errwarn()
             })
             .await
             .map_err(|_| IOError::Other)?;
 
-        self.status()?;
+        this.status()?;
 
-        let mstatus = self.info.regs().mstatus().read();
+        let mstatus = this.info.regs().mstatus().read();
         let ibi_addr = mstatus.ibiaddr();
         let ibi_type = mstatus.ibitype();
 
-        // Step 5: For normal IBIs (not Hot-Join or Controller-Request), drain the RX FIFO payload.
+        // Step 4b: Hot-Join and controller-request arbitration must be
+        // acknowledged explicitly by software.
+        //
+        // RM 53.7.31 `MSTATUS[IBIWON]`: "Arbitration requires **manual
+        // intervention for CR and HJ**, and optionally requires it for IBI if
+        // MCTRL[IBIRESP] = 3 (manual)." The `MCTRL[IBIRESP]` value programmed
+        // alongside AUTOIBI only auto-responds to plain IBIs; for HJ/CR the
+        // peripheral parks in the `IBIACK` state holding the bus until an
+        // explicit `IBIACKNACK` request arrives.
+        //
+        // Leaving it parked is not benign: RM 53.7.36 `MERRWARN[INVREQ]` lists
+        // "not using IBI ACK NACK when stopped in manual hold for IBI
+        // acknowledgment" as an invalid-request error, so the *next* request
+        // (e.g. the RSTDAA that follows a Hot-Join) fails with INVREQ.
+        //
+        // Matches `I3C_TransferStateMachineIBIWonState` in the NXP SDK, which
+        // calls `I3C_MasterEmitIBIResponse()` whenever the master state is
+        // `kI3C_MasterStateIbiAck`.
+        if matches!(ibi_type, Ibitype::Hj | Ibitype::Mr) {
+            this.async_emit_ibi_response(Ibiresp::Ack).await?;
+        }
+
+        // Step 5: For normal IBIs, drain the RX FIFO payload.
         let mut payload_len = 0;
         if ibi_type == Ibitype::Ibi && !buf.is_empty() {
             'read: for byte in buf.iter_mut() {
                 loop {
                     // Drain available RX FIFO bytes.
-                    if self.info.regs().mdatactrl().read().rxcount() != 0 {
-                        *byte = self.info.regs().mrdatab().read().value();
+                    if this.info.regs().mdatactrl().read().rxcount() != 0 {
+                        *byte = this.info.regs().mrdatab().read().value();
                         payload_len += 1;
                         break;
                     }
 
                     // COMPLETE means the target has sent all its payload bytes.
-                    if self.info.regs().mstatus().read().complete() {
+                    if this.info.regs().mstatus().read().complete() {
                         break 'read;
                     }
 
                     // Wait for more bytes (rxpend) or end of message (complete).
-                    self.info
+                    this.info
                         .wait_cell()
                         .wait_for(|| {
-                            self.info.regs().mintset().write(|w| {
+                            this.info.regs().mintset().write(|w| {
                                 w.set_rxpend(true);
                                 w.set_complete(true);
                                 w.set_errwarn(true);
                             });
-                            let s = self.info.regs().mstatus().read();
+                            let s = this.info.regs().mstatus().read();
                             s.rxpend() || s.complete() || s.errwarn()
                         })
                         .await
                         .map_err(|_| IOError::Other)?;
 
-                    self.status()?;
+                    this.status()?;
                 }
             }
 
             // Drain any remaining bytes the caller's buffer couldn't hold.
-            while self.info.regs().mdatactrl().read().rxcount() != 0 {
-                let _ = self.info.regs().mrdatab().read().value();
+            while this.info.regs().mdatactrl().read().rxcount() != 0 {
+                let _ = this.info.regs().mrdatab().read().value();
             }
         }
 
         // Step 6: Wait for COMPLETE (marks end of IBI reception, state transitions to NORMACT).
-        if !self.info.regs().mstatus().read().complete() {
-            self.async_wait_for_complete().await?;
+        if !this.info.regs().mstatus().read().complete() {
+            this.async_wait_for_complete().await?;
         }
 
-        // Step 7: Clear status flags and emit a STOP to terminate the IBI
-        // sequence on the bus before the caller issues their follow-on
-        // transfer. This matches the NXP SDK master driver
-        // (`fsl_i3c.c` I3C_MasterTransferHandleIRQ → I3C_MasterEmitStop on
-        // `kStatus_I3C_IBIWon`) and is what spec-compliant targets expect.
-        self.clear_flags();
-        self.async_stop(BusType::I3cSdr).await?;
+        // Step 7: Clear status flags and return the bus to Idle before the
+        // caller issues their follow-on transfer (for a Hot-Join that is
+        // typically RSTDAA + ENTDAA, which requires `State::Idle`).
+        //
+        // `async_stop` is only legal from NORMACT; after some IBI flavours the
+        // peripheral has already stopped itself, so gate on the actual state
+        // rather than on the IBI type.
+        this.clear_flags();
 
-        Ok((ibi_addr, payload_len))
+        if this.info.regs().mstatus().read().state() == State::Normact {
+            this.async_stop(BusType::I3cSdr).await?;
+        }
+
+        // The bus is back at Idle and every sticky flag is clear, so there is
+        // nothing left for the guard to undo.
+        on_drop.defuse();
+
+        match ibi_type {
+            Ibitype::Ibi => Ok(IbiEvent::Ibi {
+                address: ibi_addr,
+                payload_len,
+            }),
+            Ibitype::Hj => Ok(IbiEvent::HotJoin),
+            Ibitype::Mr => Ok(IbiEvent::ControllerRequest),
+            Ibitype::None => Err(IOError::Other),
+        }
     }
 
     /// Read from address into buffer asynchronously.
