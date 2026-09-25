@@ -8,7 +8,7 @@ use core::sync::atomic::{AtomicU8, AtomicU32, AtomicUsize, Ordering, fence};
 use core::task::Poll;
 
 use bbqueue::BBQueue;
-use bbqueue::prod_cons::stream::StreamGrantW;
+use bbqueue::prod_cons::framed::FramedGrantW;
 use bbqueue::traits::coordination::cas::AtomicCoord;
 use bbqueue::traits::notifier::maitake::MaiNotSpsc;
 use bbqueue::traits::storage::Storage;
@@ -19,7 +19,7 @@ use grounded::uninit::GroundedCell;
 use super::{DeviceCharacteristics, Info, Instance, SclPin, SdaPin};
 pub use crate::clocks::periph_helpers::{Div4, I3cClockSel, I3cConfig};
 use crate::clocks::{ClockError, PoweredClock, WakeGuard, enable_and_reset};
-use crate::dma::{Channel, DmaChannel, DmaRequest, PeripheralWriteOperation, TransferOptions};
+use crate::dma::{Channel, DMA_MAX_TRANSFER_SIZE, DmaChannel, DmaRequest, PeripheralWriteOperation, TransferOptions};
 use crate::gpio::{AnyPin, SealedPin};
 use crate::interrupt::typelevel;
 use crate::interrupt::typelevel::Interrupt;
@@ -100,6 +100,10 @@ pub enum IOError {
     /// The `ibi_payload` supplied to an IBI API is larger than
     /// [`MAX_IBI_PAYLOAD`].
     IbiPayloadTooLarge,
+    /// The queued controller write does not fit the supplied buffer. The
+    /// transaction stays queued; retry with a buffer of at least
+    /// [`I3c::pending_write_len`] bytes.
+    BufferTooSmall,
     /// Other internal errors or unexpected state.
     Other,
 }
@@ -596,13 +600,17 @@ impl<'d> I3c<'d> {
     /// - `rx_dma`: The DMA channel for receiving data (moved into the
     ///   per-instance BBQ state for the lifetime of this driver).
     /// - `rx_buffer`: A `'static` mutable byte slice used as the RX
-    ///   `bbqueue::BBQueue` storage. Must be at least
-    ///   `2 * max_rx_transaction` bytes long.
+    ///   `bbqueue::BBQueue` storage. Size it with [`rx_buffer_size`],
+    ///   which accounts for the per-transaction framing header and lets
+    ///   you pick how many writes may queue before the ring fills.
     /// - `max_rx_transaction`: Upper bound, in bytes, on the size of a
     ///   single I3C controller-write transaction the slave is willing to
     ///   buffer. Each RX DMA grant is opened at this size, guaranteeing
     ///   a single transaction is never split across a BBQ ring wrap.
-    ///   Choose `>=` the largest controller write you expect (e.g. 64).
+    ///   Set it `>=` [`Config::max_write_len`], the length advertised to the
+    ///   controller via GETMWL and itself capped at 4095, and a compliant
+    ///   controller cannot outrun one grant. A write that does exceed it
+    ///   spills into a second frame with no error reported.
     /// - `_irq`: The interrupt binding for the I3C peripheral.
     /// - `config`: The configuration for the I3C target.
     ///
@@ -621,7 +629,7 @@ impl<'d> I3c<'d> {
         max_rx_transaction: usize,
         config: Config,
     ) -> Result<Self, SetupError> {
-        if max_rx_transaction == 0 || rx_buffer.len() < 2 * max_rx_transaction {
+        if !rx_capacity_ok(rx_buffer.len(), max_rx_transaction) {
             return Err(SetupError::InvalidConfiguration);
         }
 
@@ -763,17 +771,31 @@ impl<'d> I3c<'d> {
         Ok(ReadStatus::Complete(buf.len()))
     }
 
+    /// Length of the next queued controller write, or `None` if the
+    /// queue is empty. Peeking leaves the transaction queued.
+    pub fn pending_write_len(&self) -> Option<usize> {
+        if (self.bbq_state.state.load(Ordering::Acquire) & STATE_RXDMA_PRESENT) == 0 {
+            return None;
+        }
+        // SAFETY: RXDMA_PRESENT implies rx_queue was initialized.
+        let queue = unsafe { &*self.bbq_state.rx_queue.get() };
+        // Dropping the read grant keeps the frame queued.
+        queue.framed_consumer().read().ok().map(|rgr| rgr.len())
+    }
+
     /// Receive a controller-initiated write into `buf` via the
     /// always-on BBQ RX path.
     ///
-    /// Awaits a committed bbqueue grant (committed by the BBQ ISR on
-    /// either a bus Stop or a DMA major-loop completion), copies up to
-    /// `buf.len()` bytes into `buf`, and releases the consumed portion
-    /// of the grant. The DMA stays armed for the next transaction; no
-    /// per-call DMA setup happens here.
+    /// Awaits one committed bbqueue frame (committed by the BBQ ISR on
+    /// either a bus Stop or a DMA major-loop completion) and copies it
+    /// into `buf`. The queue runs in framed mode, so each call returns
+    /// exactly one controller write even when several completed while
+    /// the caller was busy elsewhere. The DMA stays armed for the next
+    /// transaction; no per-call DMA setup happens here.
     ///
-    /// Returns the number of bytes copied (1..=`buf.len()`). Returns
-    /// `Ok(0)` only if `buf` is empty.
+    /// Returns the number of bytes copied. Returns `Ok(0)` only if `buf`
+    /// is empty, and [`IOError::BufferTooSmall`] — leaving the
+    /// transaction queued — if `buf` cannot hold all of it.
     ///
     /// # Cancellation safety
     ///
@@ -791,13 +813,18 @@ impl<'d> I3c<'d> {
         // through INITED + RXDMA_PRESENT in `new_dma`. The rx_queue
         // is therefore safe for shared access.
         let queue = unsafe { &*self.bbq_state.rx_queue.get() };
-        let cons = queue.stream_consumer();
+        let cons = queue.framed_consumer();
         let rgr = cons.wait_read().await;
-        let avail = rgr.len();
-        let n = buf.len().min(avail);
-        buf[..n].copy_from_slice(&rgr[..n]);
+        let n = rgr.len();
+        if n > buf.len() {
+            // A framed grant cannot be partially released, so requeue the
+            // whole transaction rather than hand back a fragment.
+            rgr.keep();
+            return Err(IOError::BufferTooSmall);
+        }
+        buf[..n].copy_from_slice(&rgr);
 
-        rgr.release(n);
+        rgr.release();
 
         // If the IRQ couldn't open the next grant (ring transiently
         // full), pend a STOP to retry now that we've freed space. The
@@ -952,7 +979,6 @@ impl<'d> I3c<'d> {
         if ibi_payload.len() > MAX_IBI_PAYLOAD {
             return Err(IOError::IbiPayloadTooLarge);
         }
-
         if self.info.regs().sstatus().read().ibidis() == Ibidis::InterruptsDisabled {
             return Err(IOError::IbiDisabled);
         }
@@ -1285,7 +1311,6 @@ impl<'d> I3c<'d> {
                         w.set_start(true);
                         w.set_matched(true);
                         w.set_stop(true);
-                        w.set_rxpend(true);
                         w.set_dachg(true);
                         w.set_ccc(true);
                         w.set_ddrmatched(true);
@@ -1312,7 +1337,6 @@ impl<'d> I3c<'d> {
                         || status.chandled()
                         || status.dachg()
                         || status.event()
-                        || status.rx_pend()
                         || self.bbq_state.has_pending()
                         || (status.txnotfull() == SstatusTxnotfull::NotFull && status.streqrd() == Streqrd::Busy)
                 })
@@ -1383,7 +1407,9 @@ impl<'d> I3c<'d> {
                 self.info.regs().sintclr().write(|w| w.set_txsend(true));
                 return Ok(Event::TxPending);
             }
-            if status.rx_pend() || self.bbq_state.has_pending() {
+            // `RX_PEND` is deliberately not consulted: it latches mid-transaction,
+            // whereas a committed frame is what `dma_respond_to_write` can return.
+            if self.bbq_state.has_pending() {
                 return Ok(Event::RxPending);
             }
             if status.chandled() {
@@ -1591,6 +1617,45 @@ pub(crate) const STATE_RXGR_ACTIVE: u32 = 0b0000_0100;
 pub(crate) const STATE_RXDMA_PRESENT: u32 = 0b0000_1000;
 pub(crate) const STATE_RXDMA_COMPLETE: u32 = 0b0001_0000;
 
+/// Length header stored alongside every committed transaction, so that
+/// [`dma_respond_to_write`](I3c::dma_respond_to_write) can hand back one
+/// controller write at a time. Counts against `rx_buffer`, which is why
+/// [`rx_buffer_size`] adds it per queued transaction.
+pub const RX_FRAME_HEADER_LEN: usize = core::mem::size_of::<u16>();
+
+/// Smallest RX queue depth the driver can run with: one grant being filled by
+/// DMA while the consumer still holds the previous one.
+pub const MIN_RX_TRANSACTIONS: usize = 2;
+
+/// Bytes of `rx_buffer` needed to queue `transactions` controller writes of up
+/// to `max_rx_transaction` bytes each, i.e.
+/// `(max_rx_transaction + RX_FRAME_HEADER_LEN) * transactions`.
+///
+/// `transactions` must be at least [`MIN_RX_TRANSACTIONS`]. One slot is always
+/// held by the grant DMA is currently filling, so `transactions - 1` writes can
+/// sit undrained; past that RX DMA cannot re-arm and the next write overruns.
+///
+/// A slot is reserved at full `max_rx_transaction` size no matter how short the
+/// write turns out to be, so size that bound to the largest write you actually
+/// expect rather than a generous round number.
+///
+/// ```ignore
+/// const MAX_WRITE: usize = 64;
+/// const RX_BUF_SIZE: usize = rx_buffer_size(MAX_WRITE, 4);
+/// static RX_BUF: ConstStaticCell<[u8; RX_BUF_SIZE]> = ConstStaticCell::new([0u8; RX_BUF_SIZE]);
+/// ```
+pub const fn rx_buffer_size(max_rx_transaction: usize, transactions: usize) -> usize {
+    (max_rx_transaction + RX_FRAME_HEADER_LEN) * transactions
+}
+
+/// Whether `max_rx_transaction` is programmable as one eDMA major loop and
+/// `rx_buffer` can hold two in-flight framed transactions of that size.
+fn rx_capacity_ok(rx_buffer_len: usize, max_rx_transaction: usize) -> bool {
+    max_rx_transaction != 0
+        && max_rx_transaction <= DMA_MAX_TRANSFER_SIZE
+        && rx_buffer_len >= rx_buffer_size(max_rx_transaction, MIN_RX_TRANSACTIONS)
+}
+
 /// Per-instance BBQ state for the I3C target RX path.
 ///
 /// Constructed at compile time via BbqState::new() (one static per
@@ -1612,8 +1677,10 @@ pub struct BbqState {
     /// The RX bbqueue. Only valid when STATE_RXDMA_PRESENT is set.
     rx_queue: GroundedCell<BBQueue<Container, AtomicCoord, MaiNotSpsc>>,
     /// The active RX grant (DMA write target). Only valid when
-    /// STATE_RXDMA_PRESENT + STATE_RXGR_ACTIVE are both set.
-    rxgr: GroundedCell<StreamGrantW<&'static BBQueue<Container, AtomicCoord, MaiNotSpsc>>>,
+    /// STATE_RXDMA_PRESENT + STATE_RXGR_ACTIVE are both set. Deref
+    /// yields the frame body, so the length header stays invisible to
+    /// the DMA programming below.
+    rxgr: GroundedCell<FramedGrantW<&'static BBQueue<Container, AtomicCoord, MaiNotSpsc>, u16>>,
     /// The RX DMA channel. Only valid when STATE_RXDMA_PRESENT is set.
     rxdma: GroundedCell<DmaChannel<'static>>,
     /// The RX DMA request number. Only valid when STATE_RXDMA_PRESENT is set.
@@ -1621,11 +1688,11 @@ pub struct BbqState {
 
     /// Size in bytes of every RX grant opened by `start_read_transfer`.
     /// Set once in `init_rx` from the user-supplied `max_rx_transaction`
-    /// parameter. Using `grant_exact(rx_grant_size)` (instead of
-    /// `grant_max_remaining`) guarantees each grant is a single
+    /// parameter. Using `grant(rx_grant_size)` (instead of a
+    /// max-remaining grant) guarantees each grant is a single
     /// contiguous DMA region, so a single I3C controller transaction
-    /// cannot be split across a BBQ ring wrap. The user must ensure
-    /// `rx_buffer.len() >= 2 * rx_grant_size`.
+    /// cannot be split across a BBQ ring wrap. Each grant also costs
+    /// `RX_FRAME_HEADER_LEN` bytes of framing on top of this size.
     pub(crate) rx_grant_size: AtomicUsize,
 }
 
@@ -1695,10 +1762,9 @@ impl BbqState {
         // SAFETY: RXDMA_PRESENT guarantees queue initialization, and the
         // function's safety contract excludes concurrent queue access.
         let queue = unsafe { &*self.rx_queue.get() };
-        let consumer = queue.stream_consumer();
+        let consumer = queue.framed_consumer();
         while let Ok(read_grant) = consumer.read() {
-            let len = read_grant.len();
-            read_grant.release(len);
+            read_grant.release();
         }
 
         // Reset the STOP sequence counter.
@@ -1764,10 +1830,10 @@ impl BbqState {
         self.uninit_to_initing()?;
 
         // Each RX grant is exactly `max_rx_transaction` bytes (one whole
-        // I3C controller-write transaction). Ring must hold at least two
-        // so the IRQ can re-arm into a fresh contiguous slot while the
-        // consumer is still draining the previous one.
-        if max_rx_transaction == 0 || rx_buffer.len() < 2 * max_rx_transaction {
+        // I3C controller-write transaction) plus its framing header. Ring
+        // must hold at least two so the IRQ can re-arm into a fresh
+        // contiguous slot while the consumer is still draining the previous one.
+        if !rx_capacity_ok(rx_buffer.len(), max_rx_transaction) {
             return Err(());
         }
         self.rx_grant_size.store(max_rx_transaction, Ordering::Release);
@@ -1808,7 +1874,7 @@ impl BbqState {
         Ok(())
     }
 
-    /// Returns true if there are committed bytes the consumer side has
+    /// Returns true if a whole controller write has been committed and
     /// not yet drained. Used by `listen()` to surface `Event::RxPending`
     /// since with BBQ the FIFO is continuously drained and the
     /// `SSTATUS.RX_PEND` flag never latches.
@@ -1818,7 +1884,8 @@ impl BbqState {
         }
         // SAFETY: RXDMA_PRESENT implies rx_queue was initialized.
         let queue = unsafe { &*self.rx_queue.get() };
-        queue.stream_consumer().read().is_ok()
+        // Dropping the read grant keeps the frame queued.
+        queue.framed_consumer().read().is_ok()
     }
 
     /// Close the active RX grant, committing the bytes DMA wrote.
@@ -1859,7 +1926,13 @@ impl BbqState {
             let sstrt = rxgr.as_ptr() as usize;
             let ttl = daddr.wrapping_sub(sstrt).min(rxgr.len());
 
-            rxgr.commit(ttl);
+            if ttl == 0 {
+                // A framed commit is visible even at length zero, so abort
+                // instead and let the next re-arm reopen the grant.
+                rxgr.abort();
+            } else {
+                rxgr.commit(ttl as u16);
+            }
         }
         self.state.fetch_and(!STATE_RXGR_ACTIVE, Ordering::AcqRel);
     }
@@ -1874,9 +1947,9 @@ impl BbqState {
     /// * Must be called from ISR context (or with exclusive access)
     unsafe fn start_read_transfer(&'static self, info: &'static Info) -> bool {
         let rx_queue = unsafe { &*self.rx_queue.get() };
-        let prod = rx_queue.stream_producer();
+        let prod = rx_queue.framed_producer();
         let grant_size = self.rx_grant_size.load(Ordering::Acquire);
-        let mut wgr = match prod.grant_exact(grant_size) {
+        let mut wgr = match prod.grant(grant_size as u16) {
             Ok(g) => g,
             Err(_) => {
                 // Ring is full / no contiguous space — consumer hasn't

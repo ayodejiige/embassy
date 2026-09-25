@@ -16,10 +16,21 @@ pub fn verify_equal<T: PartialEq + defmt::Format + Copy>(actual: &[T], expected:
             actual.get(mismatch_idx),
             expected.get(mismatch_idx),
         );
-        let end = (mismatch_idx + 8).min(actual.len());
         let start = mismatch_idx.saturating_sub(2);
-        error!("  actual  [{}..{}] = {}", start, end, &actual[start..end]);
-        error!("  expected[{}..{}] = {}", start, end, &expected[start..end]);
+        let actual_end = (mismatch_idx + 8).min(actual.len());
+        let expected_end = (mismatch_idx + 8).min(expected.len());
+        error!(
+            "  actual  [{}..{}] = {}",
+            start.min(actual_end),
+            actual_end,
+            &actual[start.min(actual_end)..actual_end]
+        );
+        error!(
+            "  expected[{}..{}] = {}",
+            start.min(expected_end),
+            expected_end,
+            &expected[start.min(expected_end)..expected_end]
+        );
         panic!();
     }
 }
